@@ -129,9 +129,9 @@ pub fn session_from_argv_with_commands(
     let primary = flag_from_template(template)?;
     let mut flags = vec![primary.clone()];
     // Kiro loan: kiro-cli has shipped both `--resume-id` and `--resume`
-    // spellings, so accept both here. Re-check once kiro-cli settles on one
-    // `--resume` spelling and drop the non-canonical alt. Keep the
-    // `kiro-fallback` default consistent with whichever spelling survives.
+    // spellings (`--resume-id` canonical today). Drop the non-canonical
+    // alt once kiro-cli settles on one spelling; keep `kiro-fallback`
+    // consistent with whichever survives.
     if agent == "kiro" {
         for alt in ["--resume-id", "--resume"] {
             if alt != primary && !flags.iter().any(|f| f == alt) {
@@ -169,6 +169,7 @@ pub fn session_from_argv_with_commands(
 }
 
 /// `session_from_argv_with_commands` against the default command templates.
+#[cfg(test)]
 pub fn session_from_argv(agent: &str, proc_argv: &[Vec<String>]) -> Option<SessionRef> {
     session_from_argv_with_commands(agent, proc_argv, &crate::config::default_commands())
 }
@@ -244,6 +245,7 @@ pub fn resolve_session_with_commands(
 }
 
 /// `resolve_session_with_commands` against the default command templates.
+#[cfg(test)]
 pub fn resolve_session(
     pane: &Pane,
     registry_value: Option<&SessionRef>,

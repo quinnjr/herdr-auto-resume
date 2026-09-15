@@ -573,44 +573,14 @@ mod tests {
         );
     }
 
-    use crate::test_support::{lock_env, unique_temp_dir};
+    use crate::test_support::run_with_fake_herdr;
 
     /// Hermetic harness: fake `HERDR_BIN_PATH` + temp state dir (both
     /// `HERDR_PLUGIN_STATE_DIR` and `HERDR_PLUGIN_CONFIG_DIR` point at it).
+    /// Thin wrapper over `crate::test_support::run_with_fake_herdr` (kept
+    /// so existing tests are untouched).
     fn with_poll_harness(script_body: &str, f: impl FnOnce(&std::path::PathBuf)) {
-        let _guard = lock_env();
-        let prev_bin = std::env::var_os("HERDR_BIN_PATH");
-        let prev_state = std::env::var_os("HERDR_PLUGIN_STATE_DIR");
-        let prev_config = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR");
-        let base = unique_temp_dir("monitor-harness");
-        let bin_dir = base.join("bin");
-        std::fs::create_dir_all(&bin_dir).expect("bin dir");
-        let bin_path = bin_dir.join("herdr");
-        std::fs::write(&bin_path, script_body).expect("write fake herdr");
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&bin_path, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod fake herdr");
-        let state_dir = base.join("state");
-        std::fs::create_dir_all(&state_dir).expect("state dir");
-        std::env::set_var("HERDR_BIN_PATH", &bin_path);
-        std::env::set_var("HERDR_PLUGIN_STATE_DIR", &state_dir);
-        std::env::set_var("HERDR_PLUGIN_CONFIG_DIR", &state_dir);
-        let result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&state_dir)));
-        match prev_bin {
-            Some(v) => std::env::set_var("HERDR_BIN_PATH", v),
-            None => std::env::remove_var("HERDR_BIN_PATH"),
-        }
-        match prev_state {
-            Some(v) => std::env::set_var("HERDR_PLUGIN_STATE_DIR", v),
-            None => std::env::remove_var("HERDR_PLUGIN_STATE_DIR"),
-        }
-        match prev_config {
-            Some(v) => std::env::set_var("HERDR_PLUGIN_CONFIG_DIR", v),
-            None => std::env::remove_var("HERDR_PLUGIN_CONFIG_DIR"),
-        }
-        std::fs::remove_dir_all(&base).ok();
-        assert!(result.is_ok());
+        run_with_fake_herdr(script_body, &[], |dir| f(&dir.to_path_buf()));
     }
 
     #[test]
@@ -644,6 +614,32 @@ mod tests {
             let log = std::fs::read_to_string(state_dir.join("log.txt"))
                 .expect("log exists");
             assert!(log.contains("relaunched claude"), "log names agent: {log}");
+        });
+    }
+
+    #[test]
+    fn poll_once_process_info_failure_vetoes_relaunch() {
+        let script = "#!/bin/sh\necho \"$1 $2 $3\" >> \"$(dirname \"$0\")/calls.log\"\nif [ \"$1\" = \"pane\" ] && [ \"$2\" = \"get\" ]; then\necho '{\"id\":\"cli:pane:get\",\"result\":{\"pane\":{\"pane_id\":\"w1:p1\",\"agent_status\":\"unknown\"}}}'\nexit 0\nfi\nif [ \"$1\" = \"pane\" ] && [ \"$2\" = \"process-info\" ]; then\nexit 1\nfi\nexit 1\n";
+        with_poll_harness(script, |state_dir| {
+            crate::state::remember(
+                "w1:p1",
+                SessionRef {
+                    agent: "claude".into(),
+                    value: "abc-123".into(),
+                },
+            );
+            let config = Config::default();
+            let mut cooldown: Option<Instant> = None;
+            assert!(poll_once("w1:p1", &config, &mut cooldown));
+            assert_eq!(cooldown, None, "vetoed poll must not set cooldown");
+            let calls_path = state_dir.parent().expect("state has parent").join("bin/calls.log");
+            let calls = std::fs::read_to_string(&calls_path).expect("calls log exists");
+            assert!(calls.contains("pane get"), "fake must have seen pane get: {calls}");
+            assert!(calls.contains("pane process-info"), "fake must have seen process-info: {calls}");
+            assert!(!calls.contains("pane run"), "no pane run may be invoked: {calls}");
+            let log = std::fs::read_to_string(state_dir.join("log.txt"))
+                .expect("log exists");
+            assert!(log.contains("vetoing relaunch"), "log names veto: {log}");
         });
     }
 

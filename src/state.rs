@@ -22,6 +22,7 @@ fn log_path() -> PathBuf {
 /// One-shot auto-migration: when the target `state_dir()/registry.json` is
 /// absent but `$HERDR_PLUGIN_CONFIG_DIR/registry.json` exists at a different
 /// path, the legacy file is copied over before loading.
+/// REMOVE-AFTER: delete once installs older than v0.1.x are negligible.
 pub fn load_registry() -> HashMap<String, SessionRef> {
     let target = registry_path();
     if !target.exists() {
@@ -31,16 +32,26 @@ pub fn load_registry() -> HashMap<String, SessionRef> {
                 if let Some(parent) = target.parent() {
                     std::fs::create_dir_all(parent).ok();
                 }
-                match std::fs::copy(&src, &target) {
+                // Atomic migration: stage into registry.json.tmp in the
+                // target dir, then rename onto registry.json (same
+                // pattern as save_registry, so a crash never leaves a
+                // half-written registry).
+                let tmp = target.with_extension("json.tmp");
+                match std::fs::copy(&src, &tmp)
+                    .and_then(|_| std::fs::rename(&tmp, &target))
+                {
                     Ok(_) => eprintln!(
                         "load_registry: migrated registry from {} to {}",
                         src.display(),
                         target.display()
                     ),
-                    Err(e) => eprintln!(
-                        "load_registry: migration from {} failed: {e}",
-                        src.display()
-                    ),
+                    Err(e) => {
+                        std::fs::remove_file(&tmp).ok();
+                        eprintln!(
+                            "load_registry: migration from {} failed: {e}",
+                            src.display()
+                        )
+                    }
                 }
             }
         }
@@ -52,7 +63,13 @@ pub fn load_registry() -> HashMap<String, SessionRef> {
     // Tolerant loader: a single bad entry must not wipe the whole map.
     let raw: HashMap<String, serde_json::Value> = match serde_json::from_str(&text) {
         Ok(m) => m,
-        Err(_) => return HashMap::new(),
+        Err(e) => {
+            eprintln!(
+                "load_registry: corrupt {}: {e}",
+                target.display()
+            );
+            return HashMap::new();
+        }
     };
     let mut out = HashMap::new();
     for (k, v) in raw {
@@ -101,6 +118,7 @@ use crate::resume::is_safe_session_value;
 /// Legacy lock-file path (`:` -> `_`), kept for migration from the
 /// pre-encoding layout. New code writes via [`monitor_lock_path`]; reads
 /// fall back here when the new path is absent.
+/// REMOVE-AFTER: delete once installs older than v0.1.x are negligible.
 fn legacy_monitor_lock_path(pane_id: &str) -> PathBuf {
     monitors_dir().join(format!("{}.json", pane_id.replace(':', "_")))
 }
@@ -170,9 +188,11 @@ pub fn write_monitor_lock_pid(pane_id: &str, pid: u32) -> bool {
         }
     }
     let legacy = legacy_monitor_lock_path(pane_id);
-    // Legacy migration: when only the legacy file exists, a live rival keeps
-    // its claim (return false, files untouched); a stale/corrupt legacy file
-    // is renamed to the new name so the normal reclaim path below handles it.
+    // Legacy migration (REMOVE-AFTER: delete once installs older than
+    // v0.1.x are negligible): when only the legacy file exists, a live
+    // rival keeps its claim (return false, files untouched); a
+    // stale/corrupt legacy file is renamed to the new name so the normal
+    // reclaim path below handles it.
     if legacy != path && !path.exists() && legacy.exists() {
         match std::fs::read_to_string(&legacy) {
             Ok(legacy_text) => match parse_lock_text(&legacy_text) {
@@ -254,6 +274,8 @@ pub fn write_monitor_lock_pid(pane_id: &str, pid: u32) -> bool {
 /// Remove a pane's monitor lock. Best-effort; invalid ids are rejected
 /// without touching the filesystem. Removes both the new encoded path and
 /// any leftover legacy path.
+/// REMOVE-AFTER: drop the legacy-path removal once installs older than
+/// v0.1.x are negligible.
 pub fn clear_monitor_lock(pane_id: &str) {
     if !valid_pane_id(pane_id) {
         eprintln!("clear_monitor_lock: rejected invalid pane id {pane_id:?}");
@@ -322,6 +344,7 @@ pub fn monitor_locks() -> Vec<(String, u32)> {
 /// be used: unreadable or corrupt JSON / missing fields. Exposed so
 /// `status` can surface them; [`monitor_locks`] already logs each skip
 /// to stderr when it encounters them.
+#[cfg(test)]
 pub fn unreadable_locks() -> Vec<String> {
     let dir = monitors_dir();
     let entries = match std::fs::read_dir(&dir) {
@@ -375,6 +398,7 @@ fn lock_record(pane_id: &str) -> Option<(u32, Option<String>)> {
         };
     }
     // Fall back to the legacy filename when the new encoded path is absent.
+    // REMOVE-AFTER: delete once installs older than v0.1.x are negligible.
     let legacy = legacy_monitor_lock_path(pane_id);
     if legacy == new_path {
         return None;
@@ -445,6 +469,7 @@ fn cmdline_is_monitor_for_pane(cmdline: &str, pane_id: &str) -> bool {
 /// it describes the monitor for `pane_id`. The thin `ps` wrapper below
 /// feeds it live output; unit tests cover this function directly (no
 /// live processes needed).
+#[cfg(any(test, not(target_os = "linux")))]
 fn ps_output_is_monitor(output: &str, pane_id: &str) -> bool {
     cmdline_is_monitor_for_pane(output, pane_id)
 }
@@ -896,6 +921,10 @@ mod tests {
             let reg = load_registry();
             assert_eq!(reg["w7G:p1"].value, "sess-1");
             assert!(dst_dir.join("registry.json").exists());
+            assert!(
+                !dst_dir.join("registry.json.tmp").exists(),
+                "atomic migration must not leave tmp behind"
+            );
             // Second load is a no-op (target now present).
             let reg2 = load_registry();
             assert_eq!(reg2["w7G:p1"].value, "sess-1");
@@ -1006,6 +1035,39 @@ mod tests {
             assert_eq!(v["pid"].as_u64().unwrap() as u32, pid);
             child.kill().ok();
             child.wait().ok();
+        });
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn corrupt_legacy_lock_migrates_to_valid_claim() {
+        let dir = with_temp_state_dir(|dir| {
+            let pane = "w7G:p1";
+            let legacy = dir.join("monitors/w7G_p1.json");
+            std::fs::create_dir_all(legacy.parent().unwrap()).expect("monitors dir");
+            std::fs::write(&legacy, "not-json{").expect("corrupt legacy");
+            assert!(!monitor_lock_path(pane).exists());
+            // Corrupt legacy must not block the claim: reclaim succeeds.
+            assert!(write_monitor_lock_pid(pane, 2147483646));
+            assert!(!legacy.exists(), "corrupt legacy must migrate away");
+            let text = std::fs::read_to_string(monitor_lock_path(pane))
+                .expect("new lock exists");
+            let v: serde_json::Value =
+                serde_json::from_str(&text).expect("new lock parses");
+            assert_eq!(v["pane_id"], pane);
+            assert_eq!(v["pid"].as_u64().unwrap() as u32, 2147483646);
+        });
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_registry_top_level_corruption_returns_empty() {
+        let dir = with_temp_state_dir(|dir| {
+            std::fs::write(dir.join("registry.json"), "not-json{")
+                .expect("corrupt registry");
+            // Must not panic; corrupt top-level JSON yields an empty map.
+            let reg = load_registry();
+            assert!(reg.is_empty());
         });
         std::fs::remove_dir_all(&dir).ok();
     }

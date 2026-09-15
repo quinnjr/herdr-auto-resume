@@ -56,6 +56,7 @@ fn panes_from_result(result: &Value) -> Vec<Pane> {
     out
 }
 
+#[cfg(test)]
 fn parse_panes(raw: &str) -> Vec<Pane> {
     serde_json::from_str::<Value>(raw)
         .ok()
@@ -66,6 +67,9 @@ fn parse_panes(raw: &str) -> Vec<Pane> {
 
 /// Run `herdr <args...>` with a 10s timeout, returning the raw output.
 /// On timeout the child is killed and Err("timeout") is returned (fail-closed).
+///
+/// Pipes are drained concurrently by reader threads so a child that fills
+/// stdout/stderr cannot deadlock against the `try_wait` poll loop.
 fn run_raw(args: &[&str]) -> Result<std::process::Output, String> {
     let bin = std::env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".to_string());
     let mut child = std::process::Command::new(&bin)
@@ -77,18 +81,37 @@ fn run_raw(args: &[&str]) -> Result<std::process::Output, String> {
             eprintln!("herdr: spawn failed: {} {}: {e}", bin, args.join(" "));
             format!("spawn: {e}")
         })?;
+    // Take the pipes so reader threads own them; the child can keep writing
+    // while we poll try_wait below.
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = stdout_pipe {
+            use std::io::Read;
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = stderr_pipe {
+            use std::io::Read;
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    });
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => {
-                // Child has exited, so wait_with_output returns immediately.
-                return child.wait_with_output().map_err(|e| {
-                    eprintln!(
-                        "herdr: wait failed: {} {}: {e}",
-                        bin,
-                        args.join(" ")
-                    );
-                    format!("wait: {e}")
+            Ok(Some(status)) => {
+                // Child has exited; pipes hit EOF so readers finish promptly.
+                let stdout = stdout_reader.join().unwrap_or_default();
+                let stderr = stderr_reader.join().unwrap_or_default();
+                return Ok(std::process::Output {
+                    status,
+                    stdout,
+                    stderr,
                 });
             }
             Ok(None) => {
@@ -107,6 +130,15 @@ fn run_raw(args: &[&str]) -> Result<std::process::Output, String> {
                             args.join(" ")
                         );
                     }
+                    // Pipes are closed after kill+wait, so readers terminate.
+                    // Do NOT join them here: an orphaned grandchild (e.g. the
+                    // `sleep 30` in the timeout test) can inherit the pipe
+                    // write ends and hold them open past the deadline, which
+                    // would turn the 10s timeout into a 30s hang. Detach the
+                    // readers (drop the JoinHandles); they finish on their own
+                    // once every writer exits.
+                    std::mem::drop(stdout_reader);
+                    std::mem::drop(stderr_reader);
                     eprintln!("herdr: invoke timed out after 10s: {} {}", bin, args.join(" "));
                     return Err("timeout".to_string());
                 }
@@ -114,6 +146,12 @@ fn run_raw(args: &[&str]) -> Result<std::process::Output, String> {
             }
             Err(e) => {
                 eprintln!("herdr: wait failed: {} {}: {e}", bin, args.join(" "));
+                let _ = child.kill();
+                let _ = child.wait();
+                // Detach readers (see timeout path): joining could block on
+                // grandchild-inherited pipes; we return Err either way.
+                std::mem::drop(stdout_reader);
+                std::mem::drop(stderr_reader);
                 return Err(format!("wait: {e}"));
             }
         }
@@ -126,6 +164,32 @@ fn stderr_tail_200(stderr: &str) -> String {
         chars[chars.len() - 200..].iter().collect()
     } else {
         stderr.to_string()
+    }
+}
+
+/// Shared `run_raw` + non-zero-exit check + tailed stderr log.
+/// Returns `Some(output)` only when the child exited successfully;
+/// spawn/timeout/wait failures and non-zero exits log and yield `None`.
+fn run_checked(args: &[&str], ctx: &str) -> Option<std::process::Output> {
+    match run_raw(args) {
+        Err(e) => {
+            eprintln!("herdr: {ctx} failed for {}: {e}", args.join(" "));
+            None
+        }
+        Ok(o) => {
+            if !o.status.success() {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                let tail = stderr_tail_200(stderr.trim());
+                eprintln!(
+                    "herdr: {ctx} non-zero exit {} for {}: {tail}",
+                    o.status,
+                    args.join(" ")
+                );
+                None
+            } else {
+                Some(o)
+            }
+        }
     }
 }
 
@@ -159,23 +223,7 @@ fn extract_result(output: &std::process::Output) -> Option<Value> {
 /// False-success guards: a non-zero exit status bails outright;
 /// top-level `"error"` envelopes are skipped; `result: null` counts as absent.
 pub fn invoke(args: &[&str]) -> Option<Value> {
-    let output = match run_raw(args) {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!("herdr: invoke failed: {}: {e}", args.join(" "));
-            return None;
-        }
-    };
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let tail = stderr_tail_200(stderr.trim());
-        eprintln!(
-            "herdr: non-zero exit {} for {}: {tail}",
-            output.status,
-            args.join(" ")
-        );
-        return None;
-    }
+    let output = run_checked(args, "invoke")?;
     extract_result(&output)
 }
 
@@ -184,22 +232,13 @@ pub fn pane_list() -> Vec<Pane> {
 }
 
 pub fn pane_list_checked() -> Option<Vec<Pane>> {
-    let output = match run_raw(&["pane", "list"]) {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!("herdr: pane list failed: {e}");
-            return None;
-        }
-    };
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let tail = stderr_tail_200(stderr.trim());
-        eprintln!("herdr: pane list non-zero exit {}: {tail}", output.status);
-        return None;
-    }
+    let output = run_checked(&["pane", "list"], "pane list")?;
     match extract_result(&output) {
         Some(r) => Some(panes_from_result(&r)),
-        None => Some(Vec::new()),
+        None => {
+            eprintln!("herdr: pane list returned no result envelope");
+            None
+        }
     }
 }
 
@@ -226,26 +265,7 @@ pub fn pane_get(id: &str) -> Option<Pane> {
 pub fn pane_run(id: &str, argv: &[&str]) -> bool {
     let mut args = vec!["pane", "run", id];
     args.extend_from_slice(argv);
-    match run_raw(&args) {
-        Err(e) => {
-            eprintln!("herdr: pane_run failed for {}: {e}", args.join(" "));
-            false
-        }
-        Ok(o) => {
-            if o.status.success() {
-                true
-            } else {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                let tail = stderr_tail_200(stderr.trim());
-                eprintln!(
-                    "herdr: pane_run non-zero exit {} for {}: {tail}",
-                    o.status,
-                    args.join(" ")
-                );
-                false
-            }
-        }
-    }
+    run_checked(&args, "pane_run").is_some()
 }
 
 pub fn process_info(id: &str) -> Option<Value> {
@@ -572,5 +592,12 @@ mod tests {
                 assert_eq!(pane_list_checked(), None);
             },
         );
+    }
+
+    #[test]
+    fn pane_list_checked_none_on_success_without_envelope() {
+        with_fake_herdr("#!/bin/sh\necho 'garbage no json here'\nexit 0\n", || {
+            assert_eq!(pane_list_checked(), None);
+        });
     }
 }

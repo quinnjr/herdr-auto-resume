@@ -35,3 +35,72 @@ pub(crate) fn unique_temp_dir(prefix: &str) -> PathBuf {
     std::fs::create_dir_all(&dir).expect("create temp dir");
     dir
 }
+
+/// Hermetic harness shared by main/monitor tests: fake `HERDR_BIN_PATH`
+/// plus isolated state/config dirs.
+///
+/// Layout mirrors the old monitor harness: `base/bin/herdr` (executable,
+/// `@CALL_LOG@` replaced with the calls-log path when present) and
+/// `base/state` for both `HERDR_PLUGIN_CONFIG_DIR` and
+/// `HERDR_PLUGIN_STATE_DIR`, so `state.parent()/bin/calls.log` resolves
+/// to the calls log next to the fake binary. Applies `extra_env`
+/// (`Some` = set, `None` = remove), runs `f(&state_dir)`, then restores
+/// BIN+CONFIG+STATE+PANE_ID+EVENT_JSON and removes the base dir.
+/// Serialized on the crate-wide env lock; asserts the closure did not
+/// panic.
+pub(crate) fn run_with_fake_herdr(
+    script: &str,
+    extra_env: &[(&str, Option<&str>)],
+    f: impl FnOnce(&std::path::Path),
+) {
+    let _guard = lock_env();
+    let prev_bin = std::env::var_os("HERDR_BIN_PATH");
+    let prev_config = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR");
+    let prev_state = std::env::var_os("HERDR_PLUGIN_STATE_DIR");
+    let prev_pane = std::env::var_os("HERDR_PANE_ID");
+    let prev_event = std::env::var_os("HERDR_PLUGIN_EVENT_JSON");
+    let base = unique_temp_dir("harness-test");
+    let bin_dir = base.join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("create bin dir");
+    let state_dir = base.join("state");
+    std::fs::create_dir_all(&state_dir).expect("create state dir");
+    let call_log = state_dir.join("calls.log");
+    let body = script.replace("@CALL_LOG@", &call_log.to_string_lossy());
+    let bin = bin_dir.join("herdr");
+    std::fs::write(&bin, body).expect("write fake herdr");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod fake herdr");
+    std::env::set_var("HERDR_BIN_PATH", &bin);
+    std::env::set_var("HERDR_PLUGIN_CONFIG_DIR", &state_dir);
+    std::env::set_var("HERDR_PLUGIN_STATE_DIR", &state_dir);
+    for (k, v) in extra_env {
+        match v {
+            Some(s) => std::env::set_var(k, s),
+            None => std::env::remove_var(k),
+        }
+    }
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&state_dir)));
+    match prev_bin {
+        Some(v) => std::env::set_var("HERDR_BIN_PATH", v),
+        None => std::env::remove_var("HERDR_BIN_PATH"),
+    }
+    match prev_config {
+        Some(v) => std::env::set_var("HERDR_PLUGIN_CONFIG_DIR", v),
+        None => std::env::remove_var("HERDR_PLUGIN_CONFIG_DIR"),
+    }
+    match prev_state {
+        Some(v) => std::env::set_var("HERDR_PLUGIN_STATE_DIR", v),
+        None => std::env::remove_var("HERDR_PLUGIN_STATE_DIR"),
+    }
+    match prev_pane {
+        Some(v) => std::env::set_var("HERDR_PANE_ID", v),
+        None => std::env::remove_var("HERDR_PANE_ID"),
+    }
+    match prev_event {
+        Some(v) => std::env::set_var("HERDR_PLUGIN_EVENT_JSON", v),
+        None => std::env::remove_var("HERDR_PLUGIN_EVENT_JSON"),
+    }
+    std::fs::remove_dir_all(&base).ok();
+    assert!(r.is_ok());
+}

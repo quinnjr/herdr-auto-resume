@@ -356,7 +356,7 @@ mod tests {
     }
 
     // ---- review-fix guards (hermetic: fake herdr + temp state dir) ----
-    use crate::test_support::{lock_env, unique_temp_dir};
+    use crate::test_support::run_with_fake_herdr;
 
     /// Fake `herdr`: logs argv to @CALL_LOG@, serves agentless panes for
     /// w1:argv / w1:evt, a live-agent pane with session for w9:live,
@@ -384,63 +384,20 @@ exit 0
 
     /// Run `f` with HERDR_BIN_PATH faked, state/config dirs isolated to a
     /// fresh temp dir, and `extra` env vars set (`Some`) or removed
-    /// (`None`); everything is restored afterwards. Serialized: env is
-    /// process-global (module-local lock; see report for cross-module note).
+    /// (`None`); everything is restored afterwards. Serialized on the
+    /// crate-wide `crate::test_support::lock_env` (env is process-global).
     fn run_isolated(extra: &[(&str, Option<&str>)], f: impl FnOnce(&std::path::Path)) {
         run_isolated_with_script(FAKE_HERDR, extra, f);
     }
 
+    /// Thin wrapper over `crate::test_support::run_with_fake_herdr` (kept
+    /// so existing tests are untouched).
     fn run_isolated_with_script(
         script: &str,
         extra: &[(&str, Option<&str>)],
         f: impl FnOnce(&std::path::Path),
     ) {
-        let _guard = lock_env();
-        let prev_bin = std::env::var_os("HERDR_BIN_PATH");
-        let prev_config = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR");
-        let prev_state = std::env::var_os("HERDR_PLUGIN_STATE_DIR");
-        let prev_pane = std::env::var_os("HERDR_PANE_ID");
-        let prev_event = std::env::var_os("HERDR_PLUGIN_EVENT_JSON");
-        let dir = unique_temp_dir("main-test");
-        let call_log = dir.join("calls.log");
-        let body = script.replace("@CALL_LOG@", &call_log.to_string_lossy());
-        let bin = dir.join("herdr");
-        std::fs::write(&bin, body).expect("write fake herdr");
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod fake herdr");
-        std::env::set_var("HERDR_BIN_PATH", &bin);
-        std::env::set_var("HERDR_PLUGIN_CONFIG_DIR", &dir);
-        std::env::set_var("HERDR_PLUGIN_STATE_DIR", &dir);
-        for (k, v) in extra {
-            match v {
-                Some(s) => std::env::set_var(k, s),
-                None => std::env::remove_var(k),
-            }
-        }
-        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&dir)));
-        match prev_bin {
-            Some(v) => std::env::set_var("HERDR_BIN_PATH", v),
-            None => std::env::remove_var("HERDR_BIN_PATH"),
-        }
-        match prev_config {
-            Some(v) => std::env::set_var("HERDR_PLUGIN_CONFIG_DIR", v),
-            None => std::env::remove_var("HERDR_PLUGIN_CONFIG_DIR"),
-        }
-        match prev_state {
-            Some(v) => std::env::set_var("HERDR_PLUGIN_STATE_DIR", v),
-            None => std::env::remove_var("HERDR_PLUGIN_STATE_DIR"),
-        }
-        match prev_pane {
-            Some(v) => std::env::set_var("HERDR_PANE_ID", v),
-            None => std::env::remove_var("HERDR_PANE_ID"),
-        }
-        match prev_event {
-            Some(v) => std::env::set_var("HERDR_PLUGIN_EVENT_JSON", v),
-            None => std::env::remove_var("HERDR_PLUGIN_EVENT_JSON"),
-        }
-        std::fs::remove_dir_all(&dir).ok();
-        assert!(r.is_ok());
+        run_with_fake_herdr(script, extra, f);
     }
 
     fn herdr_calls(dir: &std::path::Path) -> String {
@@ -568,6 +525,35 @@ exit 1
         run_isolated_with_script(FAILING_HERDR, &[], |dir| {
             assert_eq!(supervise_all(), 1);
             assert!(herdr_calls(dir).contains("pane list"));
+        });
+    }
+
+    /// Fake `herdr` serving an agentless pane list containing one invalid
+    /// id: supervise_all must skip it without ever passing it to herdr,
+    /// and the agentless valid pane (no registry ref) is skipped too.
+    const EVIL_LIST_HERDR: &str = r#"#!/bin/sh
+echo "$@" >> "@CALL_LOG@"
+if [ "$1" = "pane" ] && [ "$2" = "list" ]; then
+  echo '{"id":"x","result":{"panes":[{"pane_id":"../../evil"},{"pane_id":"w1:p1"}]}}'
+else
+  echo '{"id":"x","result":null}'
+fi
+exit 0
+"#;
+
+    #[test]
+    fn supervise_all_skips_invalid_pane_id_without_touching_it() {
+        run_isolated_with_script(EVIL_LIST_HERDR, &[], |dir| {
+            assert_eq!(supervise_all(), 0);
+            let calls = herdr_calls(dir);
+            assert!(
+                calls.contains("pane list"),
+                "must list panes, got: {calls}"
+            );
+            assert!(
+                !calls.contains("../../evil"),
+                "invalid id must never reach herdr, got: {calls}"
+            );
         });
     }
 
