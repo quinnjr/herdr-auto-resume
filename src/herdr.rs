@@ -279,7 +279,11 @@ pub fn pane_get(id: &str) -> Option<Pane> {
 }
 
 pub fn pane_run(id: &str, argv: &[&str]) -> bool {
-    let mut args = vec!["pane", "run", id];
+    // `--` separates the pane id from the command: resume argv may carry
+    // flags herdr itself defines (notably `--session` for opencode/pi),
+    // which herdr would otherwise consume as its own global option and
+    // fail with `server_not_running` for a bogus session name.
+    let mut args = vec!["pane", "run", id, "--"];
     args.extend_from_slice(argv);
     run_checked(&args, "pane_run").is_some()
 }
@@ -578,6 +582,21 @@ mod tests {
             || {
                 let pane = pane_get("w1:p9").expect("schema drift degrades to bare pane");
                 assert_eq!(pane.pane_id, "w1:p9");
+            },
+        );
+    }
+
+    #[test]
+    fn pane_run_inserts_separator_before_command() {
+        // Regression: resume argv containing herdr's own global flags
+        // (e.g. opencode/pi `--session`) was consumed by herdr itself
+        // (`server_not_running` for a session named like the agent
+        // session id). `pane run` must separate the pane id from the
+        // command with `--` so agent flags reach the pane verbatim.
+        with_fake_herdr(
+            "#!/bin/sh\nif [ \"$4\" = \"--\" ]; then exit 0; else echo \"missing --: $@\"; exit 1; fi\n",
+            || {
+                assert!(pane_run("w1:p1", &["opencode", "--session", "ses-1"]));
             },
         );
     }

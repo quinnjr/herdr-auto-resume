@@ -24,12 +24,16 @@ fn is_bare_idle_shell(argv: &[String]) -> bool {
 
 /// Relaunch decision. True ONLY when every foreground process is a bare
 /// idle shell (a live foreground process — agent or script — vetoes),
-/// AND the pane looks agentless (status unknown/absent, or no agent
-/// recorded), AND the post-relaunch cooldown has expired.
+/// AND the post-relaunch cooldown has expired.
+///
+/// Foreground-only by design: after a crash the pane keeps a stale agent
+/// label + status while the process is gone, so recorded metadata must
+/// not veto. Session resolution in `decide_poll` still requires a known
+/// session (live, registry, or argv-derived); without one the poll
+/// degrades to a logged `NoResume`, never a blind launch.
 ///
 /// Load-bearing guard: never returns true with a live foreground process.
 pub fn should_relaunch(
-    pane: &Pane,
     proc_argv: &[Vec<String>],
     cooldown_until: Option<Instant>,
 ) -> bool {
@@ -38,14 +42,7 @@ pub fn should_relaunch(
             return false;
         }
     }
-    if proc_argv.is_empty() || !proc_argv.iter().all(|a| is_bare_idle_shell(a)) {
-        return false;
-    }
-    match pane.agent_status.as_deref() {
-        None => true,
-        Some(s) if s.eq_ignore_ascii_case("unknown") => true,
-        _ => pane.agent.is_none(),
-    }
+    !proc_argv.is_empty() && proc_argv.iter().all(|a| is_bare_idle_shell(a))
 }
 
 /// Extract foreground argv vectors from a `process-info` result object.
@@ -133,6 +130,13 @@ pub fn decide_poll(
     config: &Config,
     cooldown_until: &Option<Instant>,
 ) -> PollAction {
+    // Dead pane first: an idle-shell foreground means the agent process is
+    // gone even when the pane still records an agent (stale crash
+    // metadata). Refreshing the registry here would just re-record the
+    // stale session and skip the relaunch.
+    if should_relaunch(proc_argv, *cooldown_until) {
+        return relaunch_for_dead_pane(pane, proc_argv, registry, config);
+    }
     if pane.agent.is_some() {
         if let Some(sess) = crate::resume::resolve_session_with_commands(
             pane,
@@ -143,9 +147,19 @@ pub fn decide_poll(
             return PollAction::Refresh(sess);
         }
     }
-    if !should_relaunch(pane, proc_argv, *cooldown_until) {
-        return PollAction::Nothing;
-    }
+    PollAction::Nothing
+}
+
+/// Resolve the relaunch for a dead (idle-shell foreground) pane: the
+/// recorded agent (or registry ref when the pane names none) plus the
+/// best-known session value feeds the resume template; unknown agent or
+/// valueless template degrades to a logged `NoResume`.
+fn relaunch_for_dead_pane(
+    pane: &Pane,
+    proc_argv: &[Vec<String>],
+    registry: &HashMap<String, SessionRef>,
+    config: &Config,
+) -> PollAction {
     let registry_value = registry.get(&pane.pane_id);
     if pane.agent.is_none() && registry_value.is_none() {
         return PollAction::NoResume {
@@ -341,26 +355,58 @@ mod tests {
 
     #[test]
     fn relaunches_dead_pane_at_idle_shell() {
-        let pane = Pane { pane_id: "w1:p1".into(), agent: None,
-            agent_status: Some("unknown".into()), ..Default::default() };
         let argv = vec![vec!["/usr/bin/zsh".into()]];
-        assert!(should_relaunch(&pane, &argv, None));
+        assert!(should_relaunch(&argv, None));
+    }
+
+    #[test]
+    fn decide_poll_relaunches_dead_kiro_pane_via_fallback() {
+        // Crash shape (live 2026-09-15, kiro w9M:p1): stale agent label +
+        // idle status, bare `--resume` foreground carried no session id, so
+        // the registry is empty. Must relaunch via the valueless
+        // `kiro-fallback` template, not silently do nothing.
+        let pane = Pane { pane_id: "w9M:p1".into(), agent: Some("kiro".into()),
+            agent_status: Some("idle".into()), ..Default::default() };
+        let argv = vec![vec!["/usr/bin/zsh".into()]];
+        assert_eq!(
+            decide_poll(&pane, &argv, &HashMap::new(), &Config::default(), &None),
+            PollAction::Relaunch {
+                agent: "kiro".into(),
+                argv: vec!["kiro-cli".into(), "chat".into(), "-r".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn decide_poll_relaunches_dead_pane_with_recorded_agent() {
+        // Crash shape (live 2026-09-15, opencode wAA:p1): agent still
+        // recorded, status done, foreground idle shell, registry holds the
+        // session. Must relaunch, not merely refresh the registry.
+        let pane = Pane { pane_id: "wAA:p1".into(), agent: Some("opencode".into()),
+            agent_status: Some("done".into()), ..Default::default() };
+        let argv = vec![vec!["/usr/bin/zsh".into()]];
+        let reg = HashMap::from([("wAA:p1".into(), SessionRef {
+            agent: "opencode".into(), value: "ses_abc".into(),
+        })]);
+        assert_eq!(
+            decide_poll(&pane, &argv, &reg, &Config::default(), &None),
+            PollAction::Relaunch {
+                agent: "opencode".into(),
+                argv: vec!["opencode".into(), "--session".into(), "ses_abc".into()],
+            }
+        );
     }
 
     #[test]
     fn never_relaunches_with_live_foreground() {
-        let pane = Pane { pane_id: "w1:p1".into(), agent: Some("claude".into()),
-            agent_status: Some("working".into()), ..Default::default() };
         let argv = vec![vec!["claude".into()]];
-        assert!(!should_relaunch(&pane, &argv, None));
+        assert!(!should_relaunch(&argv, None));
     }
 
     #[test]
     fn shell_running_a_script_is_not_idle() {
-        let pane = Pane { pane_id: "w1:p1".into(), agent: None,
-            agent_status: Some("unknown".into()), ..Default::default() };
         let argv = vec![vec!["/bin/sh".into(), "myscript.sh".into()]];
-        assert!(!should_relaunch(&pane, &argv, None));
+        assert!(!should_relaunch(&argv, None));
     }
 
     /// Live `herdr pane process-info` shape captured on this machine
@@ -378,13 +424,12 @@ mod tests {
         assert_eq!(argv.len(), 3);
         assert_eq!(argv[0], vec!["kiro-cli", "--resume"]);
         // A live agent foreground must veto relaunch.
-        let pane = Pane { pane_id: "w7G:p1".into(), agent: Some("kiro".into()),
-            agent_status: Some("working".into()), ..Default::default() };
-        assert!(!should_relaunch(&pane, &argv, None));
+        assert!(!should_relaunch(&argv, None));
     }
 
     /// Live idle-shell shape (`w78:p1`, 2026-09-15): single bare zsh in
-    /// `foreground_processes` → idle, relaunchable when agentless.
+    /// `foreground_processes` → idle, relaunchable (recorded agent/status
+    /// no longer veto: after a crash they are stale).
     #[test]
     fn foreground_argv_parses_live_idle_shell_shape() {
         let info: serde_json::Value = serde_json::from_str(
@@ -393,9 +438,7 @@ mod tests {
         .expect("fixture parses");
         let argv = foreground_argv(&info);
         assert_eq!(argv, vec![vec!["/usr/bin/zsh".to_string()]]);
-        let pane = Pane { pane_id: "w78:p1".into(), agent: None,
-            agent_status: Some("unknown".into()), ..Default::default() };
-        assert!(should_relaunch(&pane, &argv, None));
+        assert!(should_relaunch(&argv, None));
     }
 
     #[test]
@@ -408,28 +451,22 @@ mod tests {
         .expect("fixture parses");
         let argv = foreground_argv(&info);
         assert_eq!(argv, vec![vec!["<unparseable>".to_string()]]);
-        let pane = Pane { pane_id: "w1:p1".into(), agent: None,
-            agent_status: Some("unknown".into()), ..Default::default() };
-        assert!(!should_relaunch(&pane, &argv, None));
+        assert!(!should_relaunch(&argv, None));
     }
 
     #[test]
     fn cooldown_vetoes_otherwise_idle_pane() {
-        let pane = Pane { pane_id: "w1:p1".into(), agent: None,
-            agent_status: Some("unknown".into()), ..Default::default() };
         let argv = vec![vec!["/usr/bin/zsh".into()]];
         let future = Some(Instant::now() + Duration::from_secs(300));
-        assert!(!should_relaunch(&pane, &argv, future));
+        assert!(!should_relaunch(&argv, future));
         let expired = Some(Instant::now() - Duration::from_secs(1));
-        assert!(should_relaunch(&pane, &argv, expired));
+        assert!(should_relaunch(&argv, expired));
     }
 
     #[test]
     fn empty_foreground_vetoes_relaunch() {
-        let pane = Pane { pane_id: "w1:p1".into(), agent: None,
-            agent_status: Some("unknown".into()), ..Default::default() };
         let argv: Vec<Vec<String>> = vec![];
-        assert!(!should_relaunch(&pane, &argv, None));
+        assert!(!should_relaunch(&argv, None));
     }
 
     #[test]
@@ -528,9 +565,7 @@ mod tests {
         .expect("fixture parses");
         let argv = foreground_argv(&info);
         assert!(argv.contains(&vec!["<unparseable>".to_string()]));
-        let pane = Pane { pane_id: "w1:p1".into(), agent: None,
-            agent_status: Some("unknown".into()), ..Default::default() };
-        assert!(!should_relaunch(&pane, &argv, None));
+        assert!(!should_relaunch(&argv, None));
     }
 
     #[test]

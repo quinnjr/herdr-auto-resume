@@ -10,10 +10,16 @@ Each supervised agent pane gets a polling **monitor**
 
 1. Refreshes the durable pane-id → session registry while the agent is
    alive (live `agent_session` → registry → process-argv derivation).
-2. Relaunches via `herdr pane run` **only** when the pane foreground is a
-   bare idle shell, the pane looks agentless (`agent_status`
-   unknown/absent, or no agent recorded), and the post-relaunch cooldown
-   has expired. Any live foreground process vetoes — failing closed.
+2. Relaunches via `herdr pane run -- <command>` **only** when every
+   pane foreground process is a bare idle shell and the post-relaunch
+   cooldown has expired. Recorded agent/status are ignored (after a
+   crash they are stale); resolving the resume command still requires a
+   known session (live `agent_session`, registry, or process-argv
+   derivation, else a valueless `<agent>-fallback` template), otherwise
+   the poll logs `NoResume` and launches nothing. Any live foreground
+   process vetoes — failing closed. The `--` separator keeps agent
+   flags that herdr itself defines (notably `--session`) from being
+   consumed as herdr's own options.
 
 Monitors exit on a `stop-<pid>` sentinel (`stop` action). They are
 spawned detached but **without `setsid`/double-fork**, so they die with
