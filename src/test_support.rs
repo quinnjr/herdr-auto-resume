@@ -39,14 +39,13 @@ pub(crate) fn unique_temp_dir(prefix: &str) -> PathBuf {
 /// Hermetic harness shared by main/monitor tests: fake `HERDR_BIN_PATH`
 /// plus isolated state/config dirs.
 ///
-/// Layout mirrors the old monitor harness: `base/bin/herdr` (executable,
-/// `@CALL_LOG@` replaced with the calls-log path when present) and
-/// `base/state` for both `HERDR_PLUGIN_CONFIG_DIR` and
-/// `HERDR_PLUGIN_STATE_DIR`, so `state.parent()/bin/calls.log` resolves
-/// to the calls log next to the fake binary. Applies `extra_env`
-/// (`Some` = set, `None` = remove), runs `f(&state_dir)`, then restores
-/// BIN+CONFIG+STATE+PANE_ID+EVENT_JSON and removes the base dir.
-/// Serialized on the crate-wide env lock; asserts the closure did not
+/// Layout: `base/bin/herdr` (executable; `@CALL_LOG@` in the script is
+/// replaced with the calls-log path) and `base/state` for both
+/// `HERDR_PLUGIN_CONFIG_DIR` and `HERDR_PLUGIN_STATE_DIR`. The calls log
+/// lives at `base/state/calls.log` (the `state_dir` handed to `f`).
+/// Applies `extra_env` (`Some` = set, `None` = remove), runs `f(&state_dir`),
+/// then restores BIN+CONFIG+STATE+PANE_ID+EVENT_JSON and removes the base
+/// dir. Serialized on the crate-wide env lock; asserts the closure did not
 /// panic.
 pub(crate) fn run_with_fake_herdr(
     script: &str,

@@ -105,9 +105,25 @@ fn run_raw(args: &[&str]) -> Result<std::process::Output, String> {
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                // Child has exited; pipes hit EOF so readers finish promptly.
-                let stdout = stdout_reader.join().unwrap_or_default();
-                let stderr = stderr_reader.join().unwrap_or_default();
+                // Child has exited, but a grandchild may still inherit the
+                // pipe write ends (same shape the timeout path guards
+                // against), so bound the reader join: collect what arrived
+                // within grace, detach the rest.
+                let grace = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while !(stdout_reader.is_finished() && stderr_reader.is_finished()) {
+                    if std::time::Instant::now() >= grace {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                let stdout = stdout_reader
+                    .is_finished()
+                    .then(|| stdout_reader.join().unwrap_or_default())
+                    .unwrap_or_default();
+                let stderr = stderr_reader
+                    .is_finished()
+                    .then(|| stderr_reader.join().unwrap_or_default())
+                    .unwrap_or_default();
                 return Ok(std::process::Output {
                     status,
                     stdout,
@@ -520,6 +536,25 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_secs(30),
             "invoke must return quickly on timeout, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn invoke_returns_despite_grandchild_holding_pipes() {
+        // Child exits 0 immediately but leaves a backgrounded grandchild
+        // holding the pipe write ends: success-path join must not hang.
+        let start = std::time::Instant::now();
+        with_fake_herdr(
+            "#!/bin/sh\nsleep 30 &\necho '{\"id\":\"x\",\"result\":{\"panes\":[]}}'\n",
+            || {
+                let panes = pane_list();
+                assert!(panes.is_empty());
+            },
+        );
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(8),
+            "invoke must not block on inherited pipes, took {elapsed:?}"
         );
     }
 

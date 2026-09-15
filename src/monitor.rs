@@ -619,7 +619,7 @@ mod tests {
 
     #[test]
     fn poll_once_process_info_failure_vetoes_relaunch() {
-        let script = "#!/bin/sh\necho \"$1 $2 $3\" >> \"$(dirname \"$0\")/calls.log\"\nif [ \"$1\" = \"pane\" ] && [ \"$2\" = \"get\" ]; then\necho '{\"id\":\"cli:pane:get\",\"result\":{\"pane\":{\"pane_id\":\"w1:p1\",\"agent_status\":\"unknown\"}}}'\nexit 0\nfi\nif [ \"$1\" = \"pane\" ] && [ \"$2\" = \"process-info\" ]; then\nexit 1\nfi\nexit 1\n";
+        let script = "#!/bin/sh\necho \"$1 $2 $3\" >> \"@CALL_LOG@\"\nif [ \"$1\" = \"pane\" ] && [ \"$2\" = \"get\" ]; then\necho '{\"id\":\"cli:pane:get\",\"result\":{\"pane\":{\"pane_id\":\"w1:p1\",\"agent_status\":\"unknown\"}}}'\nexit 0\nfi\nif [ \"$1\" = \"pane\" ] && [ \"$2\" = \"process-info\" ]; then\nexit 1\nfi\nexit 1\n";
         with_poll_harness(script, |state_dir| {
             crate::state::remember(
                 "w1:p1",
@@ -632,7 +632,7 @@ mod tests {
             let mut cooldown: Option<Instant> = None;
             assert!(poll_once("w1:p1", &config, &mut cooldown));
             assert_eq!(cooldown, None, "vetoed poll must not set cooldown");
-            let calls_path = state_dir.parent().expect("state has parent").join("bin/calls.log");
+            let calls_path = state_dir.join("calls.log");
             let calls = std::fs::read_to_string(&calls_path).expect("calls log exists");
             assert!(calls.contains("pane get"), "fake must have seen pane get: {calls}");
             assert!(calls.contains("pane process-info"), "fake must have seen process-info: {calls}");
