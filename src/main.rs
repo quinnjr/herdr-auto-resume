@@ -1,5 +1,6 @@
 mod config;
 mod herdr;
+mod kiro;
 mod monitor;
 mod resume;
 mod state;

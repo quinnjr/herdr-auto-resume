@@ -215,6 +215,42 @@ fn relaunch_for_dead_pane(
     PollAction::Relaunch { agent, argv }
 }
 
+/// Kiro session pinning (thin I/O wrapper around [`crate::kiro`]).
+///
+/// Live kiro CLIs run with a bare `--resume` (no id on the cmdline) and
+/// herdr often reports no `agent_session`, so the registry would stay
+/// empty and a later crash would fall back to `chat -r` — wrong with
+/// several same-folder sessions. While the pane is supervised and the
+/// registry lacks it, pin the freshest `chat -l` id for the pane cwd.
+/// The live primary re-saves on every turn, so it outranks stale
+/// subagent runs. Best-effort: any failure leaves the registry
+/// untouched and the existing decide path applies. `decide_poll` stays
+/// pure; with the registry populated its Refresh/Relaunch arms just work.
+fn maybe_pin_kiro_session(pane: &Pane) {
+    if pane.agent.as_deref() != Some("kiro") {
+        return;
+    }
+    if crate::state::load_registry().contains_key(&pane.pane_id) {
+        return;
+    }
+    let Some(cwd) = pane.cwd.as_deref() else {
+        return;
+    };
+    if cwd.is_empty() {
+        return;
+    }
+    let Some(id) = crate::kiro::latest_session_for_cwd(cwd) else {
+        return;
+    };
+    crate::state::remember(
+        &pane.pane_id,
+        SessionRef {
+            agent: "kiro".into(),
+            value: id,
+        },
+    );
+}
+
 /// One monitor poll. Returns false when the pane no longer exists
 /// (`pane_get` → None) so the caller can count consecutive misses.
 /// Thin I/O shell around the pure `decide_poll`.
@@ -254,6 +290,8 @@ fn poll_once(pane_id: &str, config: &Config, cooldown_until: &mut Option<Instant
             vec![]
         }
     };
+    // Kiro session pinning (best-effort discovery; registry reloaded after).
+    maybe_pin_kiro_session(&pane);
     let reg = crate::state::load_registry();
     match decide_poll(&pane, &proc_argv, &reg, config, cooldown_until) {
         PollAction::Refresh(sess) => {
@@ -675,6 +713,48 @@ mod tests {
             let log = std::fs::read_to_string(state_dir.join("log.txt"))
                 .expect("log exists");
             assert!(log.contains("vetoing relaunch"), "log names veto: {log}");
+        });
+    }
+
+    #[test]
+    fn poll_once_pins_kiro_session_from_discovery() {
+        // Live kiro pane (bare `--resume` argv carries no id, herdr
+        // reports no agent_session): the poll must pin the freshest
+        // `chat -l` id for the pane cwd into the registry.
+        let script = "#!/bin/sh\nif [ \"$1\" = \"pane\" ] && [ \"$2\" = \"get\" ]; then\necho '{\"id\":\"cli:pane:get\",\"result\":{\"pane\":{\"pane_id\":\"w9M:p1\",\"agent\":\"kiro\",\"agent_status\":\"working\",\"cwd\":\"/\"}}}'\nexit 0\nfi\nif [ \"$1\" = \"pane\" ] && [ \"$2\" = \"process-info\" ]; then\necho '{\"id\":\"cli:pane:process-info\",\"result\":{\"process_info\":{\"foreground_processes\":[{\"argv\":[\"kiro-cli\",\"--resume\"]}]}}}'\nexit 0\nfi\nexit 1\n";
+        with_poll_harness(script, |state_dir| {
+            let list = r#"[{"cwd":"/","sessions":[
+                {"sessionId":"sess-old-9","source":"v2","title":"old","updatedAt":"2026-09-15T20:00:00.000Z","messageCount":12},
+                {"sessionId":"sess-pinned-1","source":"v2","title":"live work","updatedAt":"2026-09-15T22:32:18.685Z","messageCount":44}
+            ]}]"#;
+            std::fs::write(state_dir.join("list.json"), list).expect("fixture");
+            let fake = state_dir.join("kiro-cli");
+            std::fs::write(
+                &fake,
+                format!("#!/bin/sh\ncat \"{}\"\n", state_dir.join("list.json").display()),
+            )
+            .expect("fake kiro");
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+            let prev = std::env::var_os("KIRO_BIN_PATH");
+            std::env::set_var("KIRO_BIN_PATH", &fake);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let config = Config::default();
+                let mut cooldown: Option<Instant> = None;
+                assert!(poll_once("w9M:p1", &config, &mut cooldown));
+                let reg = crate::state::load_registry();
+                assert_eq!(
+                    reg.get("w9M:p1")
+                        .map(|s| (s.agent.as_str(), s.value.as_str())),
+                    Some(("kiro", "sess-pinned-1"))
+                );
+            }));
+            match prev {
+                Some(v) => std::env::set_var("KIRO_BIN_PATH", v),
+                None => std::env::remove_var("KIRO_BIN_PATH"),
+            }
+            assert!(result.is_ok());
         });
     }
 

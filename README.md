@@ -10,6 +10,14 @@ Each supervised agent pane gets a polling **monitor**
 
 1. Refreshes the durable pane-id → session registry while the agent is
    alive (live `agent_session` → registry → process-argv derivation).
+   Kiro panes get one more source: live kiro CLIs run with a bare
+   `--resume` (no id), so while a kiro pane is supervised and the
+   registry lacks it, the monitor pins the freshest `kiro-cli chat -l
+   -f json` session id for the pane cwd (zero-message stubs skipped).
+   The live primary re-saves on every turn, so it outranks stale
+   subagent runs; two live primaries sharing one folder can still
+   cross-pin (same ambiguity as `chat -r`, frozen at pin time instead
+   of drifting).
 2. Relaunches via `herdr pane run -- <command>` **only** when every
    pane foreground process is a bare idle shell and the post-relaunch
    cooldown has expired. Recorded agent/status are ignored (after a
