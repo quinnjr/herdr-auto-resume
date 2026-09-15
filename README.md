@@ -22,13 +22,22 @@ acceptable v1.
 
 ## Install
 
+From the marketplace (builds from source — requires `cargo` + Rust stable):
+
+```bash
+herdr plugin install quinnjr/herdr-auto-resume
+herdr plugin action invoke quinnjr.auto-resume.supervise-all
+```
+
+Or develop locally:
+
 ```bash
 cargo build --release && cp target/release/auto-resume .
 herdr plugin link ~/Projects/herdr-auto-resume
-# The daemon resolves plugin commands via PATH, so expose the binary:
-ln -sf ~/Projects/herdr-auto-resume/auto-resume ~/.local/bin/auto-resume
 ```
 
+Plugin commands resolve `./auto-resume` relative to the plugin directory
+(Herdr runs them with the plugin dir as cwd), so no PATH wiring is needed.
 The binary lives at the repo root (`./auto-resume`) and is gitignored.
 Do not commit it; do commit `Cargo.lock` (binary crate).
 
