@@ -1,7 +1,8 @@
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
-use crate::herdr::{self, Pane};
+use crate::herdr::{self, Pane, SessionRef};
 
 /// Foreground programs that count as an idle shell: a bare shell with no
 /// script, `-c` command, or other arguments is a dead agent's pane.
@@ -48,24 +49,15 @@ pub fn should_relaunch(
 }
 
 /// Extract foreground argv vectors from a `process-info` result object.
-/// Best-effort across shapes (`foreground_processes` — the live shape on
-/// this host — plus `foreground` / `processes` / `process_list` /
-/// `children` lists of `{argv: [...]}` or bare argv arrays, or a single
-/// `argv`). Unknown shape yields empty (which vetoes relaunch — fail
-/// closed; the caller logs the shape for diagnosability).
+/// Only the live shape is honored (`foreground_processes` lists of
+/// `{argv: [...]}` or bare argv arrays, or a single `argv`); anything else
+/// yields empty (which vetoes relaunch — fail closed; the caller logs the
+/// shape for diagnosability).
 fn foreground_argv(info: &serde_json::Value) -> Vec<Vec<String>> {
-    for key in [
-        "foreground_processes",
-        "foreground",
-        "processes",
-        "process_list",
-        "children",
-    ] {
-        if let Some(v) = info.get(key) {
-            let out = argv_list_from(v);
-            if !out.is_empty() {
-                return out;
-            }
+    if let Some(v) = info.get("foreground_processes") {
+        let out = argv_list_from(v);
+        if !out.is_empty() {
+            return out;
         }
     }
     if let Some(argv) = info.get("argv") {
@@ -77,6 +69,11 @@ fn foreground_argv(info: &serde_json::Value) -> Vec<Vec<String>> {
     }
     vec![]
 }
+
+/// Sentinel for a foreground list with zero parseable entries. A bare
+/// sentinel never matches `IDLE_SHELLS`, so `should_relaunch` vetoes
+/// fail-closed instead of treating silent drops as an idle shell.
+const UNPARSEABLE: &str = "<unparseable>";
 
 fn argv_list_from(v: &serde_json::Value) -> Vec<Vec<String>> {
     let arr = match v.as_array() {
@@ -95,66 +92,51 @@ fn argv_list_from(v: &serde_json::Value) -> Vec<Vec<String>> {
             out.push(a);
         }
     }
+    if out.is_empty() && !arr.is_empty() {
+        return vec![vec![UNPARSEABLE.to_string()]];
+    }
     out
 }
 
-/// One monitor poll: refresh the registry while the agent is alive
-/// (threading the live config commands), then relaunch when
-/// `should_relaunch` fires. Agent-less panes need a registry ref to know
-/// what to relaunch; panes with a known agent but no session fall back
-/// to a valueless/`<agent>-fallback` template when one exists.
-/// One monitor poll. Returns false when the pane no longer exists
-/// (`pane_get` → None) so the caller can count consecutive misses.
-fn poll_once(pane_id: &str, config: &Config, cooldown_until: &mut Option<Instant>) -> bool {
-    let Some(pane) = herdr::pane_get(pane_id) else {
-        return false;
-    };
-    let proc_argv = match herdr::process_info(pane_id) {
-        Some(v) => {
-            let argv = foreground_argv(&v);
-            if argv.is_empty() {
-                // Fail-closed AND diagnosable: record the shape we saw
-                // so future `process-info` drift shows up in the log.
-                let keys = v
-                    .as_object()
-                    .map(|o| {
-                        o.keys()
-                            .map(String::as_str)
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    })
-                    .unwrap_or_else(|| "<non-object>".to_string());
-                crate::state::append_log(&format!(
-                    "monitor {pane_id}: empty foreground parse; keys={keys}"
-                ));
-            }
-            argv
-        }
-        None => vec![],
-    };
+/// Pure poll decision: refresh the registry while the agent is alive,
+/// relaunch when `should_relaunch` fires, otherwise do nothing.
+/// `should_relaunch` remains the veto core (live-foreground veto stays
+/// fail-closed: empty/unknown/sentinel argv never relaunches).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PollAction {
+    Refresh(SessionRef),
+    Relaunch { agent: String, argv: Vec<String> },
+    Nothing,
+}
+
+pub fn decide_poll(
+    pane: &Pane,
+    proc_argv: &[Vec<String>],
+    registry: &HashMap<String, SessionRef>,
+    config: &Config,
+    cooldown_until: &Option<Instant>,
+) -> PollAction {
     if pane.agent.is_some() {
-        let reg = crate::state::load_registry();
         if let Some(sess) = crate::resume::resolve_session_with_commands(
-            &pane,
-            reg.get(pane_id),
-            &proc_argv,
+            pane,
+            registry.get(&pane.pane_id),
+            proc_argv,
             &config.commands,
         ) {
-            crate::state::remember(pane_id, sess);
+            return PollAction::Refresh(sess);
         }
     }
-    if !should_relaunch(&pane, &proc_argv, *cooldown_until) {
-        return true;
+    if !should_relaunch(pane, proc_argv, *cooldown_until) {
+        return PollAction::Nothing;
     }
-    let reg = crate::state::load_registry();
-    if pane.agent.is_none() && !reg.contains_key(pane_id) {
-        return true;
+    let registry_value = registry.get(&pane.pane_id);
+    if pane.agent.is_none() && registry_value.is_none() {
+        return PollAction::Nothing;
     }
-    let registry_value = reg.get(pane_id);
     let session = crate::resume::resolve_session_with_commands(
-        &pane,
+        pane,
         registry_value,
-        &proc_argv,
+        proc_argv,
         &config.commands,
     );
     let (agent, value) = match (&pane.agent, session) {
@@ -175,24 +157,109 @@ fn poll_once(pane_id: &str, config: &Config, cooldown_until: &mut Option<Instant
                 Some(s.value)
             },
         ),
-        (None, None) => return true,
+        (None, None) => return PollAction::Nothing,
     };
     if agent.is_empty() {
-        return true;
+        return PollAction::Nothing;
     }
     let Some(argv) =
         crate::resume::resume_argv(&agent, value.as_deref(), &config.commands)
     else {
-        return true;
+        return PollAction::Nothing;
     };
-    let args: Vec<&str> = argv.iter().map(String::as_str).collect();
-    if herdr::pane_run(pane_id, &args) {
-        *cooldown_until = Some(Instant::now() + Duration::from_secs(config.cooldown_seconds));
-        crate::state::append_log(&format!("monitor {pane_id}: relaunched {agent}"));
-    } else {
-        crate::state::append_log(&format!("monitor {pane_id}: pane run failed for {agent}"));
+    PollAction::Relaunch { agent, argv }
+}
+
+/// One monitor poll: refresh the registry while the agent is alive
+/// (threading the live config commands), then relaunch when
+/// `should_relaunch` fires. Agent-less panes need a registry ref to know
+/// what to relaunch; panes with a known agent but no session fall back
+/// to a valueless/`<agent>-fallback` template when one exists.
+/// One monitor poll. Returns false when the pane no longer exists
+/// (`pane_get` → None) so the caller can count consecutive misses.
+/// Thin I/O shell around the pure `decide_poll`: loads the registry once
+/// and reuses it for refresh + decision.
+fn poll_once(pane_id: &str, config: &Config, cooldown_until: &mut Option<Instant>) -> bool {
+    let Some(pane) = herdr::pane_get(pane_id) else {
+        return false;
+    };
+    let proc_argv = match herdr::process_info(pane_id) {
+        Some(v) => {
+            let argv = foreground_argv(&v);
+            if argv.is_empty()
+                || argv
+                    .iter()
+                    .any(|a| a.iter().any(|t| t == UNPARSEABLE))
+            {
+                // Fail-closed AND diagnosable: record the shape we saw
+                // so future `process-info` drift shows up in the log.
+                let keys = v
+                    .as_object()
+                    .map(|o| {
+                        o.keys()
+                            .map(String::as_str)
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    })
+                    .unwrap_or_else(|| "<non-object>".to_string());
+                crate::state::append_log(&format!(
+                    "monitor {pane_id}: empty/unparseable foreground parse; keys={keys}"
+                ));
+            }
+            argv
+        }
+        None => vec![],
+    };
+    let reg = crate::state::load_registry();
+    match decide_poll(&pane, &proc_argv, &reg, config, cooldown_until) {
+        PollAction::Refresh(sess) => {
+            crate::state::remember(pane_id, sess);
+        }
+        PollAction::Relaunch { agent, argv } => {
+            let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+            if herdr::pane_run(pane_id, &args) {
+                *cooldown_until =
+                    Some(Instant::now() + Duration::from_secs(config.cooldown_seconds));
+                crate::state::append_log(&format!("monitor {pane_id}: relaunched {agent}"));
+            } else {
+                crate::state::append_log(&format!(
+                    "monitor {pane_id}: pane run failed for {agent}"
+                ));
+            }
+        }
+        PollAction::Nothing => {
+            // The veto passed but no resume argv could be built: log the
+            // agent/value-known state for diagnosability.
+            if should_relaunch(&pane, &proc_argv, *cooldown_until) {
+                let sess = crate::resume::resolve_session_with_commands(
+                    &pane,
+                    reg.get(pane_id),
+                    &proc_argv,
+                    &config.commands,
+                );
+                let agent_name = pane.agent.clone().unwrap_or_else(|| {
+                    sess.as_ref()
+                        .map(|s| s.agent.clone())
+                        .unwrap_or_default()
+                });
+                let known = sess
+                    .as_ref()
+                    .map(|s| !s.value.is_empty())
+                    .unwrap_or(false);
+                crate::state::append_log(&format!(
+                    "monitor {pane_id}: no resume argv for '{agent_name}' (value known: {known})"
+                ));
+            }
+        }
     }
     true
+}
+
+/// Shared monitor exit path: release the monitor lock and clear our stop
+/// sentinel.
+fn finish_monitor(pane_id: &str, own_pid: u32) {
+    crate::state::clear_monitor_lock(pane_id);
+    crate::state::clear_stop_sentinel(own_pid);
 }
 
 /// Monitor loop for one pane: claim the monitor lock FIRST, then sleep
@@ -217,8 +284,7 @@ pub fn run(pane_id: &str) {
     let own_pid = std::process::id();
     for _ in 0..config.connect_grace_seconds {
         if crate::state::stop_requested(own_pid) {
-            crate::state::clear_monitor_lock(pane_id);
-            crate::state::clear_stop_sentinel(own_pid);
+            finish_monitor(pane_id, own_pid);
             return;
         }
         std::thread::sleep(Duration::from_secs(1));
@@ -229,17 +295,21 @@ pub fn run(pane_id: &str) {
     let mut missing = 0u32;
     loop {
         if crate::state::stop_requested(own_pid) {
-            crate::state::clear_monitor_lock(pane_id);
-            crate::state::clear_stop_sentinel(own_pid);
+            finish_monitor(pane_id, own_pid);
             break;
         }
         if poll_once(pane_id, &config, &mut cooldown_until) {
             missing = 0;
         } else {
             missing += 1;
+            crate::state::append_log(&format!(
+                "monitor {pane_id}: pane fetch failed (miss {missing}/10)"
+            ));
             if missing >= 10 {
-                crate::state::clear_monitor_lock(pane_id);
-                crate::state::clear_stop_sentinel(own_pid);
+                crate::state::append_log(&format!(
+                    "monitor {pane_id}: pane gone 10x, exiting"
+                ));
+                finish_monitor(pane_id, own_pid);
                 break;
             }
         }
@@ -250,6 +320,9 @@ pub fn run(pane_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::herdr::SessionRef;
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn relaunches_dead_pane_at_idle_shell() {
@@ -308,5 +381,119 @@ mod tests {
         let pane = Pane { pane_id: "w78:p1".into(), agent: None,
             agent_status: Some("unknown".into()), ..Default::default() };
         assert!(should_relaunch(&pane, &argv, None));
+    }
+
+    #[test]
+    fn unparseable_foreground_list_vetoes_relaunch() {
+        // Non-empty list, zero parseable entries → sentinel (not a bare
+        // shell name) so the veto holds fail-closed.
+        let info: serde_json::Value = serde_json::from_str(
+            r#"{"foreground_processes":[{"foo":1},{"bar":"x"}]}"#,
+        )
+        .expect("fixture parses");
+        let argv = foreground_argv(&info);
+        assert_eq!(argv, vec![vec!["<unparseable>".to_string()]]);
+        let pane = Pane { pane_id: "w1:p1".into(), agent: None,
+            agent_status: Some("unknown".into()), ..Default::default() };
+        assert!(!should_relaunch(&pane, &argv, None));
+    }
+
+    #[test]
+    fn cooldown_vetoes_otherwise_idle_pane() {
+        let pane = Pane { pane_id: "w1:p1".into(), agent: None,
+            agent_status: Some("unknown".into()), ..Default::default() };
+        let argv = vec![vec!["/usr/bin/zsh".into()]];
+        let future = Some(Instant::now() + Duration::from_secs(300));
+        assert!(!should_relaunch(&pane, &argv, future));
+        let expired = Some(Instant::now() - Duration::from_secs(1));
+        assert!(should_relaunch(&pane, &argv, expired));
+    }
+
+    #[test]
+    fn empty_foreground_vetoes_relaunch() {
+        let pane = Pane { pane_id: "w1:p1".into(), agent: None,
+            agent_status: Some("unknown".into()), ..Default::default() };
+        let argv: Vec<Vec<String>> = vec![];
+        assert!(!should_relaunch(&pane, &argv, None));
+    }
+
+    #[test]
+    fn foreground_argv_returns_empty_on_unknown_shape() {
+        // No `foreground_processes` / `argv` keys → fallthrough empty
+        // (vetoes relaunch fail-closed).
+        let info: serde_json::Value = serde_json::from_str(
+            r#"{"frobnicate":[{"argv":["x"]}],"argv_count":1}"#,
+        )
+        .expect("fixture parses");
+        assert_eq!(foreground_argv(&info), Vec::<Vec<String>>::new());
+    }
+
+    #[test]
+    fn decide_poll_refreshes_live_session() {
+        let live = SessionRef { agent: "claude".into(), value: "live-1".into() };
+        let pane = Pane { pane_id: "w1:p1".into(), agent: Some("claude".into()),
+            agent_status: Some("working".into()), agent_session: Some(live.clone()),
+            ..Default::default() };
+        let argv = vec![vec!["claude".into(), "--resume".into(), "live-1".into()]];
+        assert_eq!(
+            decide_poll(&pane, &argv, &HashMap::new(), &Config::default(), &None),
+            PollAction::Refresh(live)
+        );
+    }
+
+    #[test]
+    fn decide_poll_relaunches_idle_shell_with_registry_ref() {
+        let pane = Pane { pane_id: "w1:p1".into(), agent: None,
+            agent_status: Some("unknown".into()), ..Default::default() };
+        let argv = vec![vec!["/usr/bin/zsh".into()]];
+        let reg = HashMap::from([("w1:p1".into(), SessionRef {
+            agent: "claude".into(), value: "abc-123".into(),
+        })]);
+        let config = Config::default();
+        assert_eq!(
+            decide_poll(&pane, &argv, &reg, &config, &None),
+            PollAction::Relaunch {
+                agent: "claude".into(),
+                argv: vec!["claude".into(), "--resume".into(), "abc-123".into()],
+            }
+        );
+        // A follow-up decide with the post-relaunch cooldown set → Nothing.
+        let cooldown = Some(Instant::now() + Duration::from_secs(config.cooldown_seconds));
+        assert_eq!(
+            decide_poll(&pane, &argv, &reg, &config, &cooldown),
+            PollAction::Nothing
+        );
+    }
+
+    #[test]
+    fn decide_poll_live_agent_is_nothing() {
+        let pane = Pane { pane_id: "w1:p1".into(), agent: Some("claude".into()),
+            agent_status: Some("working".into()), ..Default::default() };
+        let argv = vec![vec!["claude".into()]];
+        assert_eq!(
+            decide_poll(&pane, &argv, &HashMap::new(), &Config::default(), &None),
+            PollAction::Nothing
+        );
+    }
+
+    #[test]
+    fn decide_poll_nothing_when_resume_unresolvable() {
+        let config = Config::default();
+        let idle = vec![vec!["/usr/bin/zsh".into()]];
+        // (None, None): agentless idle pane, empty registry.
+        let pane = Pane { pane_id: "w1:p1".into(), agent: None,
+            agent_status: Some("unknown".into()), ..Default::default() };
+        assert_eq!(
+            decide_poll(&pane, &idle, &HashMap::new(), &config, &None),
+            PollAction::Nothing
+        );
+        // resume_argv None: known agent, idle shell, valued template, no
+        // value anywhere.
+        let pane = Pane { pane_id: "w1:p1".into(), agent: Some("claude".into()),
+            agent_status: None, ..Default::default() };
+        assert_eq!(
+            decide_poll(&pane, &idle, &HashMap::new(), &config, &None),
+            PollAction::Nothing
+        );
     }
 }

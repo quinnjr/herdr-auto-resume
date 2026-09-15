@@ -50,6 +50,7 @@ pub fn default_commands() -> HashMap<String, String> {
         ("pi".into(), "pi --session {value}".into()),
         ("hermes".into(), "hermes --resume {value}".into()),
         ("kiro".into(), "kiro-cli chat --resume-id {value}".into()),
+        ("kiro-fallback".into(), "kiro-cli chat -r".into()),
     ])
 }
 
@@ -73,10 +74,14 @@ fn config_file_path() -> Option<PathBuf> {
 }
 
 /// Clamp loaded values into sane bounds: a zero poll would busy-loop
-/// the monitor, and an unbounded grace would stall its start.
+/// the monitor, an unbounded grace would stall its start, and an absurd
+/// cooldown would panic on `Instant + Duration`.
 fn clamp(config: &mut Config) {
     if config.poll_seconds < 1 {
         config.poll_seconds = 1;
+    }
+    if config.cooldown_seconds > 86_400 {
+        config.cooldown_seconds = 86_400;
     }
     if config.connect_grace_seconds > 3600 {
         config.connect_grace_seconds = 3600;
@@ -122,13 +127,16 @@ pub fn load() -> Config {
     config
 }
 
-/// Resolve the plugin state dir: `HERDR_PLUGIN_CONFIG_DIR`, then
-/// `HERDR_PLUGIN_STATE_DIR`, else the default config-tree path.
+/// Resolve the plugin state dir: `HERDR_PLUGIN_STATE_DIR`, then
+/// `HERDR_PLUGIN_CONFIG_DIR` (legacy fallback), else the default
+/// config-tree path. Only mutable state (registry/locks/log/sentinels)
+/// lives here; `config.json` is always read from
+/// `HERDR_PLUGIN_CONFIG_DIR` via `config_file_path`.
 pub fn state_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR") {
+    if let Some(dir) = std::env::var_os("HERDR_PLUGIN_STATE_DIR") {
         return PathBuf::from(dir);
     }
-    if let Some(dir) = std::env::var_os("HERDR_PLUGIN_STATE_DIR") {
+    if let Some(dir) = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR") {
         return PathBuf::from(dir);
     }
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| {
@@ -140,6 +148,51 @@ pub fn state_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// Serializes the config tests: they mutate the process-global
+    /// `HERDR_PLUGIN_CONFIG_DIR` / `HERDR_PLUGIN_STATE_DIR`, so they must
+    /// never run concurrently. (Poison-tolerant: a failed test must not
+    /// wedge the rest.)
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn unique_temp_dir() -> PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "auto-resume-config-test-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+            n
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    /// Save both env vars, run `f` under the lock, then restore.
+    fn with_saved_env(f: impl FnOnce()) {
+        let _guard = lock_env();
+        let prev_config = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR");
+        let prev_state = std::env::var_os("HERDR_PLUGIN_STATE_DIR");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        match prev_config {
+            Some(v) => std::env::set_var("HERDR_PLUGIN_CONFIG_DIR", v),
+            None => std::env::remove_var("HERDR_PLUGIN_CONFIG_DIR"),
+        }
+        match prev_state {
+            Some(v) => std::env::set_var("HERDR_PLUGIN_STATE_DIR", v),
+            None => std::env::remove_var("HERDR_PLUGIN_STATE_DIR"),
+        }
+        assert!(result.is_ok());
+    }
 
     #[test]
     fn load_clamps_poll_and_grace() {
@@ -159,10 +212,93 @@ mod tests {
     }
 
     #[test]
+    fn clamp_caps_cooldown() {
+        let mut c = Config {
+            cooldown_seconds: u64::MAX,
+            ..Config::default()
+        };
+        clamp(&mut c);
+        assert_eq!(c.cooldown_seconds, 86_400);
+    }
+
+    #[test]
     fn default_commands_cover_owner_agents() {
         let cmds = default_commands();
         assert_eq!(cmds["claude"], "claude --resume {value}");
         assert_eq!(cmds["opencode"], "opencode --session {value}");
         assert_eq!(cmds["kiro"], "kiro-cli chat --resume-id {value}");
+        assert_eq!(cmds["kiro-fallback"], "kiro-cli chat -r");
+    }
+
+    #[test]
+    fn load_merges_commands_over_defaults() {
+        with_saved_env(|| {
+            let dir = unique_temp_dir();
+            std::env::set_var("HERDR_PLUGIN_CONFIG_DIR", &dir);
+            std::env::remove_var("HERDR_PLUGIN_STATE_DIR");
+            std::fs::write(
+                dir.join("config.json"),
+                r#"{"poll_seconds": 42, "commands": {"claude": "claude --yolo --resume {value}"}}"#,
+            )
+            .expect("write config.json");
+            let loaded = load();
+            assert_eq!(loaded.poll_seconds, 42);
+            assert_eq!(loaded.commands["claude"], "claude --yolo --resume {value}");
+            // Defaults not overridden stay intact.
+            assert_eq!(loaded.commands["opencode"], "opencode --session {value}");
+            assert_eq!(loaded.commands["kiro"], "kiro-cli chat --resume-id {value}");
+            std::fs::remove_dir_all(&dir).ok();
+        });
+    }
+
+    #[test]
+    fn load_returns_defaults_when_no_file() {
+        with_saved_env(|| {
+            let dir = unique_temp_dir();
+            std::env::set_var("HERDR_PLUGIN_CONFIG_DIR", &dir);
+            std::env::remove_var("HERDR_PLUGIN_STATE_DIR");
+            assert_eq!(load(), Config::default());
+            std::fs::remove_dir_all(&dir).ok();
+        });
+    }
+
+    #[test]
+    fn state_dir_prefers_state_dir_over_config_dir() {
+        with_saved_env(|| {
+            let config_dir = unique_temp_dir();
+            let state_dir_path = unique_temp_dir();
+            std::env::set_var("HERDR_PLUGIN_CONFIG_DIR", &config_dir);
+            std::env::set_var("HERDR_PLUGIN_STATE_DIR", &state_dir_path);
+            assert_eq!(state_dir(), state_dir_path);
+            std::fs::remove_dir_all(&config_dir).ok();
+            std::fs::remove_dir_all(&state_dir_path).ok();
+        });
+    }
+
+    #[test]
+    fn state_dir_falls_back_to_config_dir() {
+        with_saved_env(|| {
+            let config_dir = unique_temp_dir();
+            std::env::set_var("HERDR_PLUGIN_CONFIG_DIR", &config_dir);
+            std::env::remove_var("HERDR_PLUGIN_STATE_DIR");
+            assert_eq!(state_dir(), config_dir);
+            std::fs::remove_dir_all(&config_dir).ok();
+        });
+    }
+
+    #[test]
+    fn state_dir_defaults_under_home() {
+        with_saved_env(|| {
+            std::env::remove_var("HERDR_PLUGIN_CONFIG_DIR");
+            std::env::remove_var("HERDR_PLUGIN_STATE_DIR");
+            let home =
+                std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| {
+                    PathBuf::from("~")
+                });
+            assert_eq!(
+                state_dir(),
+                home.join(".config/herdr/plugins/config/quinnjr.auto-resume")
+            );
+        });
     }
 }

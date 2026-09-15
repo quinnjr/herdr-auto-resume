@@ -78,35 +78,83 @@ fn flag_from_template(template: &str) -> Option<String> {
     Some(toks[idx - 1].clone())
 }
 
+/// Defense-in-depth for value substitution: the value lands in a single
+/// argv token (never re-split), but reject values that could act as flag
+/// or shell injection if ever logged/replayed through a shell — empty,
+/// ASCII whitespace, control chars, quotes, backslash, or shell
+/// metacharacters (`; & | < > ( ) $ ` ! * ? [ ] { } ~ #`).
+fn is_safe_session_value(v: &str) -> bool {
+    !v.is_empty()
+        && !v.chars().any(|c| {
+            c.is_ascii_whitespace()
+                || c.is_ascii_control()
+                || matches!(
+                    c,
+                    '"' | '\''
+                        | '\\'
+                        | ';'
+                        | '&'
+                        | '|'
+                        | '<'
+                        | '>'
+                        | '('
+                        | ')'
+                        | '$'
+                        | '`'
+                        | '!'
+                        | '*'
+                        | '?'
+                        | '['
+                        | ']'
+                        | '{'
+                        | '}'
+                        | '~'
+                        | '#'
+                )
+        })
+}
+
 /// Recover the session value for `agent` by scanning process argv for the
 /// resume flag derived from `commands` (`flag <value>` and `flag=<value>`;
 /// values starting with `-` are skipped). Unknown agent or no match → None.
+/// `kiro` also accepts the live-CLI spelling `--resume` alongside the
+/// template-derived `--resume-id` (template spelling tried first).
 pub fn session_from_argv_with_commands(
     agent: &str,
     proc_argv: &[Vec<String>],
     commands: &HashMap<String, String>,
 ) -> Option<SessionRef> {
     let template = commands.get(agent)?;
-    let flag = flag_from_template(template)?;
-    let eq_prefix = format!("{flag}=");
-    for argv in proc_argv {
-        for (i, tok) in argv.iter().enumerate() {
-            if let Some(rest) = tok.strip_prefix(&eq_prefix) {
-                if !rest.is_empty() && !rest.starts_with('-') {
-                    return Some(SessionRef {
-                        agent: agent.to_string(),
-                        value: rest.to_string(),
-                    });
-                }
-                continue;
+    let primary = flag_from_template(template)?;
+    let mut flags = vec![primary.clone()];
+    if agent == "kiro" {
+        for alt in ["--resume-id", "--resume"] {
+            if alt != primary && !flags.iter().any(|f| f == alt) {
+                flags.push(alt.to_string());
             }
-            if *tok == flag {
-                if let Some(next) = argv.get(i + 1) {
-                    if !next.is_empty() && !next.starts_with('-') {
+        }
+    }
+    for flag in &flags {
+        let eq_prefix = format!("{flag}=");
+        for argv in proc_argv {
+            for (i, tok) in argv.iter().enumerate() {
+                if let Some(rest) = tok.strip_prefix(&eq_prefix) {
+                    if !rest.is_empty() && !rest.starts_with('-') {
                         return Some(SessionRef {
                             agent: agent.to_string(),
-                            value: next.clone(),
+                            value: rest.to_string(),
                         });
+                    }
+                    continue;
+                }
+                if *tok == *flag {
+                    if let Some(next) = argv.get(i + 1) {
+                        if !next.is_empty() && !next.starts_with('-') {
+                            return Some(SessionRef {
+                                agent: agent.to_string(),
+                                value: next.clone(),
+                            });
+                        }
                     }
                 }
             }
@@ -132,9 +180,19 @@ pub fn resume_argv(
 ) -> Option<Vec<String>> {
     match value {
         Some(v) => {
+            if !is_safe_session_value(v) {
+                return None;
+            }
             let template = commands.get(agent)?;
             if template.contains(VALUE_PLACEHOLDER) {
-                Some(split_argv(&template.replace(VALUE_PLACEHOLDER, v)))
+                // Split the template first, then substitute per token: the
+                // value is never re-split, so it cannot inject extra flags.
+                Some(
+                    split_argv(template)
+                        .into_iter()
+                        .map(|t| t.replace(VALUE_PLACEHOLDER, v))
+                        .collect(),
+                )
             } else {
                 Some(split_argv(template))
             }
@@ -347,5 +405,73 @@ mod tests {
         let pane = pane_with(None, None);
         let argv = vec![vec!["claude".into(), "--resume".into(), "x".into()]];
         assert!(resolve_session(&pane, None, &argv).is_none());
+    }
+
+    #[test]
+    fn resume_argv_rejects_unsafe_session_values() {
+        let cmds = HashMap::from([("claude".into(), "claude --resume {value}".into())]);
+        // Ordinary ids substitute as a single token.
+        assert_eq!(
+            resume_argv("claude", Some("abc-123"), &cmds).unwrap(),
+            vec!["claude", "--resume", "abc-123"]
+        );
+        // Flag injection via embedded whitespace is rejected.
+        assert!(
+            resume_argv("claude", Some("x --dangerously-skip-permissions"), &cmds).is_none()
+        );
+        // Shell metacharacters are rejected.
+        assert!(resume_argv("claude", Some("a;b"), &cmds).is_none());
+        assert!(resume_argv("claude", Some(""), &cmds).is_none());
+        assert!(resume_argv("claude", Some("a\"b"), &cmds).is_none());
+        assert!(resume_argv("claude", Some("a\\b"), &cmds).is_none());
+    }
+
+    #[test]
+    fn kiro_argv_derivation_accepts_both_resume_spellings() {
+        let cmds = HashMap::from([("kiro".into(), "kiro-cli chat --resume-id {value}".into())]);
+        // Template-derived spelling.
+        let argv = vec![vec![
+            "kiro-cli".into(),
+            "chat".into(),
+            "--resume-id".into(),
+            "sess-1".into(),
+        ]];
+        assert_eq!(
+            session_from_argv_with_commands("kiro", &argv, &cmds)
+                .unwrap()
+                .value,
+            "sess-1"
+        );
+        // Live kiro CLIs also spell the flag `--resume`.
+        let argv = vec![vec![
+            "kiro-cli".into(),
+            "chat".into(),
+            "--resume".into(),
+            "sess-9".into(),
+        ]];
+        let found = session_from_argv_with_commands("kiro", &argv, &cmds).unwrap();
+        assert_eq!(found.agent, "kiro");
+        assert_eq!(found.value, "sess-9");
+        // Equals form works for the alternate spelling too.
+        let argv = vec![vec!["kiro-cli".into(), "chat".into(), "--resume=sess-9".into()]];
+        assert_eq!(
+            session_from_argv_with_commands("kiro", &argv, &cmds)
+                .unwrap()
+                .value,
+            "sess-9"
+        );
+        // Bare `--resume` with no following value carries no id.
+        let argv = vec![vec!["kiro-cli".into(), "chat".into(), "--resume".into()]];
+        assert!(session_from_argv_with_commands("kiro", &argv, &cmds).is_none());
+    }
+
+    #[test]
+    fn valued_fallback_is_ignored_when_no_value_known() {
+        let cmds = HashMap::from([
+            ("kiro".into(), "kiro-cli chat --resume-id {value}".into()),
+            ("kiro-fallback".into(), "kiro-cli chat --resume {value}".into()),
+        ]);
+        // Never emit a literal `{value}` token.
+        assert!(resume_argv("kiro", None, &cmds).is_none());
     }
 }
