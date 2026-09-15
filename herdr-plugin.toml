@@ -1,6 +1,6 @@
 id = "quinnjr.auto-resume"
 name = "Auto Resume"
-version = "0.1.1"
+version = "0.2.0"
 min_herdr_version = "0.7.5"
 description = "Relaunch dead agent panes into their previous sessions (claude, opencode, kiro-cli, ...). Rust."
 platforms = ["linux", "macos"]
