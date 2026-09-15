@@ -1,6 +1,6 @@
 [package]
 name = "auto-resume"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Relaunch dead Herdr agent panes into their previous sessions (claude, opencode, kiro-cli)"
 license = "MIT"
