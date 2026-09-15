@@ -166,8 +166,12 @@ pub fn resolve_session_with_commands(
     if let Some(live) = &pane.agent_session {
         return Some(live.clone());
     }
+    // A cross-agent registry ref is stale (pane re-created for another
+    // agent): accept it only when the pane names no agent or the same one.
     if let Some(reg) = registry_value {
-        return Some(reg.clone());
+        if pane.agent.is_none() || pane.agent.as_deref() == Some(reg.agent.as_str()) {
+            return Some(reg.clone());
+        }
     }
     let agent = pane.agent.as_deref()?;
     session_from_argv_with_commands(agent, proc_argv, commands)
@@ -293,6 +297,45 @@ mod tests {
         let found = resolve_session(&pane, None, &argv).unwrap();
         assert_eq!(found.value, "from-argv");
         assert_eq!(found.agent, "claude");
+    }
+
+    #[test]
+    fn resolve_session_ignores_registry_on_agent_mismatch() {
+        // pane.agent=Some("claude") + registry{agent:kiro} → registry
+        // ignored: falls through to argv derivation, or None.
+        let reg = SessionRef {
+            agent: "kiro".into(),
+            value: "reg-sess".into(),
+        };
+        let pane = pane_with(Some("claude"), None);
+        let argv = vec![vec!["claude".into(), "--resume".into(), "from-argv".into()]];
+        let found = resolve_session(&pane, Some(&reg), &argv).unwrap();
+        assert_eq!(found.agent, "claude");
+        assert_eq!(found.value, "from-argv");
+
+        let argv_none: Vec<Vec<String>> = vec![vec!["claude".into()]];
+        assert!(resolve_session(&pane, Some(&reg), &argv_none).is_none());
+    }
+
+    #[test]
+    fn resolve_session_accepts_registry_when_pane_agent_none() {
+        let reg = SessionRef {
+            agent: "kiro".into(),
+            value: "reg-sess".into(),
+        };
+        let pane = pane_with(None, None);
+        assert_eq!(resolve_session(&pane, Some(&reg), &[]).unwrap(), reg);
+    }
+
+    #[test]
+    fn resolve_session_accepts_registry_on_agent_match() {
+        let reg = SessionRef {
+            agent: "claude".into(),
+            value: "reg-sess".into(),
+        };
+        let pane = pane_with(Some("claude"), None);
+        let argv = vec![vec!["claude".into(), "--resume".into(), "from-argv".into()]];
+        assert_eq!(resolve_session(&pane, Some(&reg), &argv).unwrap(), reg);
     }
 
     #[test]

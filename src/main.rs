@@ -122,9 +122,10 @@ fn status() {
     );
 }
 
-/// `stop`: write a `stop-<pid>` sentinel per recorded monitor lock. The
+/// `stop`: write a `stop-<pid>` sentinel per live monitor lock. The
 /// monitor loop sees it on its next poll, clears its lock + sentinel,
-/// and exits. Never kills, closes, or touches panes.
+/// and exits. Stale locks (no live monitor behind them) are cleared
+/// instead of signalled. Never kills, closes, or touches panes.
 fn stop() {
     let locks = state::monitor_locks();
     if locks.is_empty() {
@@ -132,6 +133,11 @@ fn stop() {
         return;
     }
     for (pane_id, pid) in &locks {
+        if state::live_monitor_pid(pane_id).is_none() {
+            state::clear_monitor_lock(pane_id);
+            println!("auto-resume: cleared stale lock for {pane_id} (pid {pid})");
+            continue;
+        }
         let path = state::stop_sentinel_path(*pid);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();

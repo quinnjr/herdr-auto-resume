@@ -103,9 +103,11 @@ fn argv_list_from(v: &serde_json::Value) -> Vec<Vec<String>> {
 /// `should_relaunch` fires. Agent-less panes need a registry ref to know
 /// what to relaunch; panes with a known agent but no session fall back
 /// to a valueless/`<agent>-fallback` template when one exists.
-fn poll_once(pane_id: &str, config: &Config, cooldown_until: &mut Option<Instant>) {
+/// One monitor poll. Returns false when the pane no longer exists
+/// (`pane_get` → None) so the caller can count consecutive misses.
+fn poll_once(pane_id: &str, config: &Config, cooldown_until: &mut Option<Instant>) -> bool {
     let Some(pane) = herdr::pane_get(pane_id) else {
-        return;
+        return false;
     };
     let proc_argv = match herdr::process_info(pane_id) {
         Some(v) => {
@@ -142,11 +144,11 @@ fn poll_once(pane_id: &str, config: &Config, cooldown_until: &mut Option<Instant
         }
     }
     if !should_relaunch(&pane, &proc_argv, *cooldown_until) {
-        return;
+        return true;
     }
     let reg = crate::state::load_registry();
     if pane.agent.is_none() && !reg.contains_key(pane_id) {
-        return;
+        return true;
     }
     let registry_value = reg.get(pane_id);
     let session = crate::resume::resolve_session_with_commands(
@@ -173,27 +175,31 @@ fn poll_once(pane_id: &str, config: &Config, cooldown_until: &mut Option<Instant
                 Some(s.value)
             },
         ),
-        (None, None) => return,
+        (None, None) => return true,
     };
     if agent.is_empty() {
-        return;
+        return true;
     }
     let Some(argv) =
         crate::resume::resume_argv(&agent, value.as_deref(), &config.commands)
     else {
-        return;
+        return true;
     };
     let args: Vec<&str> = argv.iter().map(String::as_str).collect();
     if herdr::pane_run(pane_id, &args) {
         *cooldown_until = Some(Instant::now() + Duration::from_secs(config.cooldown_seconds));
         crate::state::append_log(&format!("monitor {pane_id}: relaunched {agent}"));
+    } else {
+        crate::state::append_log(&format!("monitor {pane_id}: pane run failed for {agent}"));
     }
+    true
 }
 
 /// Monitor loop for one pane: claim the monitor lock FIRST, then sleep
 /// `connect_grace_seconds` (the pane may still be connecting after
 /// restore), then poll every `poll_seconds` until a `stop-<pid>` sentinel
-/// appears for our pid.
+/// appears for our pid — or the pane stays gone for 10 straight polls
+/// (closed/deleted panes must not spin a monitor forever).
 ///
 /// Lock-then-sleep (not sleep-then-lock): the lock is visible during the
 /// long grace sleep, so a racing second monitor — and `supervise-all` —
@@ -218,13 +224,25 @@ pub fn run(pane_id: &str) {
         std::thread::sleep(Duration::from_secs(1));
     }
     let mut cooldown_until: Option<Instant> = None;
+    // A pane that stays gone (closed/deleted) must not spin a monitor
+    // forever: exit and clear the lock after 10 consecutive misses.
+    let mut missing = 0u32;
     loop {
         if crate::state::stop_requested(own_pid) {
             crate::state::clear_monitor_lock(pane_id);
             crate::state::clear_stop_sentinel(own_pid);
             break;
         }
-        poll_once(pane_id, &config, &mut cooldown_until);
+        if poll_once(pane_id, &config, &mut cooldown_until) {
+            missing = 0;
+        } else {
+            missing += 1;
+            if missing >= 10 {
+                crate::state::clear_monitor_lock(pane_id);
+                crate::state::clear_stop_sentinel(own_pid);
+                break;
+            }
+        }
         std::thread::sleep(Duration::from_secs(config.poll_seconds));
     }
 }

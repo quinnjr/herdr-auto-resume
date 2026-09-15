@@ -72,6 +72,17 @@ fn config_file_path() -> Option<PathBuf> {
         .map(|dir| PathBuf::from(dir).join("config.json"))
 }
 
+/// Clamp loaded values into sane bounds: a zero poll would busy-loop
+/// the monitor, and an unbounded grace would stall its start.
+fn clamp(config: &mut Config) {
+    if config.poll_seconds < 1 {
+        config.poll_seconds = 1;
+    }
+    if config.connect_grace_seconds > 3600 {
+        config.connect_grace_seconds = 3600;
+    }
+}
+
 /// Load config, merging `config.json` `commands` over the defaults.
 /// Missing file, unreadable file, or invalid JSON falls back to defaults
 /// (scalar overrides apply only when the file parses).
@@ -87,7 +98,13 @@ pub fn load() -> Config {
     };
     let raw: RawConfig = match serde_json::from_str(&text) {
         Ok(r) => r,
-        Err(_) => return config,
+        Err(e) => {
+            eprintln!(
+                "auto-resume: invalid config JSON in {}: {e}; using defaults",
+                path.display()
+            );
+            return config;
+        }
     };
     if let Some(v) = raw.poll_seconds {
         config.poll_seconds = v;
@@ -101,6 +118,7 @@ pub fn load() -> Config {
     if let Some(cmds) = raw.commands {
         config.commands.extend(cmds);
     }
+    clamp(&mut config);
     config
 }
 
@@ -122,6 +140,23 @@ pub fn state_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn load_clamps_poll_and_grace() {
+        let mut c = Config {
+            poll_seconds: 0,
+            cooldown_seconds: 300,
+            connect_grace_seconds: 99_999,
+            commands: default_commands(),
+        };
+        clamp(&mut c);
+        assert_eq!(c.poll_seconds, 1);
+        assert_eq!(c.connect_grace_seconds, 3600);
+        // Sane values pass through untouched.
+        let mut sane = Config::default();
+        clamp(&mut sane);
+        assert_eq!(sane, Config::default());
+    }
 
     #[test]
     fn default_commands_cover_owner_agents() {

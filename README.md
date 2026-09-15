@@ -48,6 +48,13 @@ Do not commit it; do commit `Cargo.lock` (binary crate).
 monitors. Live verification never relaunches a real agent (covered by
 unit tests instead).
 
+After `stop`, wait one poll and confirm via `status` before
+`supervise-all` (monitors exit on their next poll, not instantly).
+
+Monitor liveness on Linux verifies the recorded pid is really
+`auto-resume monitor <pane-id>` (argv reuse-guard); on macOS it is
+existence-only (no `/proc` argv check).
+
 ## config.json reference
 
 Location: `herdr plugin config-dir quinnjr.auto-resume`

@@ -39,8 +39,13 @@ pub fn save_registry(reg: &HashMap<String, SessionRef>) {
 }
 
 /// Record (or overwrite) the session for a pane, persisting to disk.
+/// Skips the write when the stored value is unchanged (monitors call this
+/// every poll while the agent is alive).
 pub fn remember(pane_id: &str, session: SessionRef) {
     let mut reg = load_registry();
+    if reg.get(pane_id) == Some(&session) {
+        return;
+    }
     reg.insert(pane_id.to_string(), session);
     save_registry(&reg);
 }
@@ -287,6 +292,50 @@ mod tests {
         }
         std::fs::remove_dir_all(&dir).ok();
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn remember_skips_write_when_value_unchanged() {
+        let dir = with_temp_state_dir(|dir| {
+            let reg_path = dir.join("registry.json");
+            let sess = SessionRef {
+                agent: "kiro".into(),
+                value: "sess-1".into(),
+            };
+            remember("w7G:p1", sess.clone());
+            let mtime_before = std::fs::metadata(&reg_path)
+                .expect("registry exists")
+                .modified()
+                .expect("mtime");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            remember("w7G:p1", sess);
+            let mtime_after = std::fs::metadata(&reg_path)
+                .expect("registry exists")
+                .modified()
+                .expect("mtime");
+            assert_eq!(
+                mtime_before, mtime_after,
+                "unchanged value must not rewrite registry"
+            );
+            // A changed value still writes.
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            remember(
+                "w7G:p1",
+                SessionRef {
+                    agent: "kiro".into(),
+                    value: "sess-2".into(),
+                },
+            );
+            let mtime_changed = std::fs::metadata(&reg_path)
+                .expect("registry exists")
+                .modified()
+                .expect("mtime");
+            assert!(
+                mtime_changed > mtime_after,
+                "changed value must rewrite registry"
+            );
+        });
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
