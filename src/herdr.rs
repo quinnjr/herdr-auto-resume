@@ -9,7 +9,7 @@ pub struct SessionRef {
     pub value: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 pub struct Pane {
     #[serde(default)]
     pub pane_id: String,

@@ -61,7 +61,10 @@ fn write_monitor_lock_pid(pane_id: &str, pid: u32) {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    let text = serde_json::json!({ "pid": pid }).to_string();
+    // pane_id is embedded so the liveness check can verify the process
+    // is the monitor for THIS pane (guards against PID reuse by a
+    // monitor for another pane or an unrelated same-named binary).
+    let text = serde_json::json!({ "pid": pid, "pane_id": pane_id }).to_string();
     std::fs::write(&path, text).ok();
 }
 
@@ -70,25 +73,30 @@ pub fn clear_monitor_lock(pane_id: &str) {
     std::fs::remove_file(monitor_lock_path(pane_id)).ok();
 }
 
-fn lock_pid(pane_id: &str) -> Option<u32> {
+fn lock_record(pane_id: &str) -> Option<(u32, Option<String>)> {
     let text = std::fs::read_to_string(monitor_lock_path(pane_id)).ok()?;
-    serde_json::from_str::<serde_json::Value>(&text)
-        .ok()?
-        .get("pid")?
-        .as_u64()
-        .map(|p| p as u32)
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let pid = v.get("pid")?.as_u64().map(|p| p as u32)?;
+    let locked_pane = v
+        .get("pane_id")
+        .and_then(|p| p.as_str())
+        .map(str::to_string);
+    Some((pid, locked_pane))
 }
 
 /// PID of the live monitor for a pane, or `None` when no lock exists, the
-/// lock is unreadable, or the recorded process is no longer our monitor
-/// (guards against PID reuse).
-///
-/// Liveness check without new deps: on Linux read `/proc/<pid>/cmdline`
-/// and require our own binary name in it; elsewhere fall back to
-/// `kill -0 <pid>` via `std::process::Command`.
+/// lock is unreadable, the lock names a different pane, or the recorded
+/// process is not the monitor for this pane (guards against PID reuse:
+/// monitors are spawned as `auto-resume monitor <pane-id>`, so the pane
+/// id must appear as an argv token in the process cmdline).
 pub fn live_monitor_pid(pane_id: &str) -> Option<u32> {
-    let pid = lock_pid(pane_id)?;
-    if pid_is_live_monitor(pid) {
+    let (pid, locked_pane) = lock_record(pane_id)?;
+    if let Some(locked) = locked_pane {
+        if locked != pane_id {
+            return None;
+        }
+    }
+    if pid_is_monitor_for_pane(pid, pane_id) {
         Some(pid)
     } else {
         None
@@ -105,26 +113,56 @@ fn our_binary_marker() -> String {
         .unwrap_or_else(|| "auto-resume".to_string())
 }
 
-fn pid_is_live_monitor(pid: u32) -> bool {
+/// True when a raw cmdline (NUL- or space-separated) belongs to the
+/// monitor for `pane_id`: it names our binary and carries the pane id as
+/// an exact argv token (exact, so `w7G:p1` never matches `w7G:p10`).
+/// Pure for testability; `pid_is_monitor_for_pane` feeds it `/proc` data.
+fn cmdline_is_monitor_for_pane(cmdline: &str, pane_id: &str) -> bool {
+    if !cmdline.contains(&our_binary_marker()) {
+        return false;
+    }
+    cmdline
+        .split(|c| c == '\0' || c == ' ')
+        .any(|tok| tok == pane_id)
+}
+
+fn pid_is_monitor_for_pane(pid: u32, pane_id: &str) -> bool {
     #[cfg(target_os = "linux")]
     {
         let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok();
         match cmdline {
             None => false,
             Some(bytes) => {
-                let flat = String::from_utf8_lossy(&bytes).replace('\0', " ");
-                flat.contains(&our_binary_marker())
+                let flat = String::from_utf8_lossy(&bytes);
+                cmdline_is_monitor_for_pane(&flat, pane_id)
             }
         }
     }
     #[cfg(not(target_os = "linux"))]
     {
+        // No /proc: cannot verify argv; fall back to existence check.
         std::process::Command::new("kill")
             .args(["-0", &pid.to_string()])
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
     }
+}
+
+/// Path of the stop-sentinel for a monitor pid. Task 6's `stop` creates
+/// `stop-<pid>`; the monitor loop checks it each poll and exits.
+pub fn stop_sentinel_path(pid: u32) -> PathBuf {
+    config::state_dir().join(format!("stop-{pid}"))
+}
+
+/// True when a stop was requested for this monitor process.
+pub fn stop_requested(pid: u32) -> bool {
+    stop_sentinel_path(pid).exists()
+}
+
+/// Remove a monitor's stop-sentinel. Best-effort.
+pub fn clear_stop_sentinel(pid: u32) {
+    std::fs::remove_file(stop_sentinel_path(pid)).ok();
 }
 
 /// Append a timestamped line to `log.txt`. Best-effort.
@@ -239,12 +277,49 @@ mod tests {
     }
 
     #[test]
-    fn live_monitor_pid_accepts_current_process() {
+    fn monitor_lock_embeds_pane_id() {
+        let dir = with_temp_state_dir(|dir| {
+            write_monitor_lock_pid("w7G:p1", 12345);
+            let text =
+                std::fs::read_to_string(dir.join("monitors/w7G_p1.json")).expect("lock exists");
+            let v: serde_json::Value = serde_json::from_str(&text).expect("valid json");
+            assert_eq!(v["pane_id"], "w7G:p1");
+        });
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn fake_monitor_cmdline(pane_id: &str) -> String {
+        format!("{}\0monitor\0{pane_id}\0", our_binary_marker())
+    }
+
+    #[test]
+    fn cmdline_matches_own_pane_only() {
+        // Own pane's monitor invocation matches.
+        assert!(cmdline_is_monitor_for_pane(
+            &fake_monitor_cmdline("w7G:p1"),
+            "w7G:p1"
+        ));
+        // Another pane's monitor does not (PID-reuse guard).
+        assert!(!cmdline_is_monitor_for_pane(
+            &fake_monitor_cmdline("w7G:p2"),
+            "w7G:p1"
+        ));
+        // Prefix pane ids never match (exact argv token).
+        assert!(!cmdline_is_monitor_for_pane(
+            &fake_monitor_cmdline("w7G:p10"),
+            "w7G:p1"
+        ));
+        // Unrelated binary with the pane id on its cmdline does not.
+        assert!(!cmdline_is_monitor_for_pane("other-bin\0w7G:p1\0", "w7G:p1"));
+    }
+
+    #[test]
+    fn live_monitor_pid_rejects_monitor_for_other_pane() {
         let dir = with_temp_state_dir(|_| {
-            // Current test process runs the `auto-resume` test binary, so
-            // its cmdline contains our binary marker.
+            // Our own process is not a `monitor w7G:p1` invocation, so
+            // even our live pid is rejected for that pane now.
             write_monitor_lock_pid("w7G:p1", std::process::id());
-            assert_eq!(live_monitor_pid("w7G:p1"), Some(std::process::id()));
+            assert_eq!(live_monitor_pid("w7G:p1"), None);
             clear_monitor_lock("w7G:p1");
             assert_eq!(live_monitor_pid("w7G:p1"), None);
         });
