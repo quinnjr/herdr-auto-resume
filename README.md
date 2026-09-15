@@ -55,6 +55,13 @@ Monitor liveness on Linux verifies the recorded pid is really
 `auto-resume monitor <pane-id>` (argv reuse-guard); on macOS it is
 existence-only (no `/proc` argv check).
 
+### Exit codes
+
+`0` success (including read-only `status`/`logs`); `1` when one or more
+spawns (`supervise-all`, `hook-pane`) or stop sentinel writes (`stop`)
+fail — the failure count is printed; `2` for usage errors (unknown
+command, `monitor` without a pane id).
+
 ## config.json reference
 
 Location: `herdr plugin config-dir quinnjr.auto-resume`
@@ -86,6 +93,10 @@ or invalid JSON → defaults.
 - Session values are recovered from process argv via the resume flag
   derived from each template (`--resume {value}` → `--resume`, both
   `flag value` and `flag=value` forms).
+- `kiro-fallback` ships a valueless default (`kiro-cli chat -r`) used when
+  no session value is known. Opt out with `"kiro-fallback": ""`, which
+  disables fallback relaunches for kiro (valued `--resume-id` resumes are
+  unaffected).
 
 ## State
 
@@ -93,3 +104,9 @@ Under the plugin config/state dir: `registry.json` (pane → session),
 `monitors/<pane>.json` (monitor locks, `:` → `_`), `stop-<pid>`
 sentinels, `log.txt`. Override dir with `HERDR_PLUGIN_CONFIG_DIR`
 (tests, dev) or `HERDR_BIN_PATH` (fake `herdr` binary).
+
+Mutable state lives under `state_dir()`: `HERDR_PLUGIN_STATE_DIR` is
+preferred, `HERDR_PLUGIN_CONFIG_DIR` is the legacy fallback, else the
+default config-tree path. There is no migration step — when only the
+config dir is set, state resolves into that same directory, so an
+existing `registry.json` keeps working in place.

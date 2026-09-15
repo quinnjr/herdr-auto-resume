@@ -81,10 +81,11 @@ fn flag_from_template(template: &str) -> Option<String> {
 /// Defense-in-depth for value substitution: the value lands in a single
 /// argv token (never re-split), but reject values that could act as flag
 /// or shell injection if ever logged/replayed through a shell — empty,
-/// ASCII whitespace, control chars, quotes, backslash, or shell
-/// metacharacters (`; & | < > ( ) $ ` ! * ? [ ] { } ~ #`).
-fn is_safe_session_value(v: &str) -> bool {
+/// leading `-` (flag-shaped), ASCII whitespace, control chars, quotes,
+/// backslash, or shell metacharacters (`; & | < > ( ) $ ` ! * ? [ ] { } ~ #`).
+pub(crate) fn is_safe_session_value(v: &str) -> bool {
     !v.is_empty()
+        && !v.starts_with('-')
         && !v.chars().any(|c| {
             c.is_ascii_whitespace()
                 || c.is_ascii_control()
@@ -127,6 +128,10 @@ pub fn session_from_argv_with_commands(
     let template = commands.get(agent)?;
     let primary = flag_from_template(template)?;
     let mut flags = vec![primary.clone()];
+    // Kiro loan: kiro-cli has shipped both `--resume-id` and `--resume`
+    // spellings, so accept both here. Re-check once kiro-cli settles on one
+    // `--resume` spelling and drop the non-canonical alt. Keep the
+    // `kiro-fallback` default consistent with whichever spelling survives.
     if agent == "kiro" {
         for alt in ["--resume-id", "--resume"] {
             if alt != primary && !flags.iter().any(|f| f == alt) {
@@ -180,11 +185,11 @@ pub fn resume_argv(
 ) -> Option<Vec<String>> {
     match value {
         Some(v) => {
-            if !is_safe_session_value(v) {
-                return None;
-            }
             let template = commands.get(agent)?;
             if template.contains(VALUE_PLACEHOLDER) {
+                if !is_safe_session_value(v) {
+                    return None;
+                }
                 // Split the template first, then substitute per token: the
                 // value is never re-split, so it cannot inject extra flags.
                 Some(
@@ -200,7 +205,10 @@ pub fn resume_argv(
         None => {
             let fallback_key = format!("{agent}-fallback");
             if let Some(fb) = commands.get(&fallback_key) {
-                if !fb.contains(VALUE_PLACEHOLDER) {
+                // An explicitly empty fallback disables the fallback: treat
+                // as absent and fall through to the primary template (None
+                // when it needs a value).
+                if !fb.is_empty() && !fb.contains(VALUE_PLACEHOLDER) {
                     return Some(split_argv(fb));
                 }
             }
@@ -472,6 +480,33 @@ mod tests {
             ("kiro-fallback".into(), "kiro-cli chat --resume {value}".into()),
         ]);
         // Never emit a literal `{value}` token.
+        assert!(resume_argv("kiro", None, &cmds).is_none());
+    }
+
+    #[test]
+    fn rejects_flag_shaped_session_values() {
+        assert!(!is_safe_session_value("--dangerously-skip-permissions"));
+    }
+
+    #[test]
+    fn valueless_template_ignores_unused_value_safety() {
+        let cmds = HashMap::from([("claude".into(), "claude --continue".into())]);
+        assert_eq!(
+            resume_argv("claude", Some("a;b"), &cmds).unwrap(),
+            vec!["claude", "--continue"]
+        );
+        assert_eq!(
+            resume_argv("claude", Some("--evil"), &cmds).unwrap(),
+            vec!["claude", "--continue"]
+        );
+    }
+
+    #[test]
+    fn empty_fallback_disables_fallback() {
+        let cmds = HashMap::from([
+            ("kiro".into(), "kiro-cli chat --resume-id {value}".into()),
+            ("kiro-fallback".into(), "".into()),
+        ]);
         assert!(resume_argv("kiro", None, &cmds).is_none());
     }
 }

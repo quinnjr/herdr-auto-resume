@@ -81,6 +81,7 @@ fn argv_list_from(v: &serde_json::Value) -> Vec<Vec<String>> {
         None => return vec![],
     };
     let mut out = Vec::new();
+    let mut dropped_any = false;
     for item in arr {
         if let Some(argv) = item.get("argv") {
             if let Ok(a) = serde_json::from_value::<Vec<String>>(argv.clone()) {
@@ -90,7 +91,16 @@ fn argv_list_from(v: &serde_json::Value) -> Vec<Vec<String>> {
         }
         if let Ok(a) = serde_json::from_value::<Vec<String>>(item.clone()) {
             out.push(a);
+        } else {
+            // Fail-closed on partial corruption: a dropped entry could be
+            // a live agent, so poison the whole parse with the sentinel
+            // (never a bare idle shell) instead of treating the survivors
+            // as the full foreground.
+            dropped_any = true;
         }
+    }
+    if dropped_any {
+        out.push(vec![UNPARSEABLE.to_string()]);
     }
     if out.is_empty() && !arr.is_empty() {
         return vec![vec![UNPARSEABLE.to_string()]];
@@ -106,6 +116,13 @@ fn argv_list_from(v: &serde_json::Value) -> Vec<Vec<String>> {
 pub enum PollAction {
     Refresh(SessionRef),
     Relaunch { agent: String, argv: Vec<String> },
+    /// Veto passed but no resume argv could be built (computed once in
+    /// `decide_poll`): `agent` is the best-known name (None when unknown),
+    /// `value_known` tracks whether a session value was known.
+    NoResume {
+        agent: Option<String>,
+        value_known: bool,
+    },
     Nothing,
 }
 
@@ -131,7 +148,10 @@ pub fn decide_poll(
     }
     let registry_value = registry.get(&pane.pane_id);
     if pane.agent.is_none() && registry_value.is_none() {
-        return PollAction::Nothing;
+        return PollAction::NoResume {
+            agent: None,
+            value_known: false,
+        };
     }
     let session = crate::resume::resolve_session_with_commands(
         pane,
@@ -157,28 +177,33 @@ pub fn decide_poll(
                 Some(s.value)
             },
         ),
-        (None, None) => return PollAction::Nothing,
+        (None, None) => {
+            return PollAction::NoResume {
+                agent: None,
+                value_known: false,
+            }
+        }
     };
     if agent.is_empty() {
-        return PollAction::Nothing;
+        return PollAction::NoResume {
+            agent: None,
+            value_known: value.is_some(),
+        };
     }
     let Some(argv) =
         crate::resume::resume_argv(&agent, value.as_deref(), &config.commands)
     else {
-        return PollAction::Nothing;
+        return PollAction::NoResume {
+            agent: Some(agent),
+            value_known: value.is_some(),
+        };
     };
     PollAction::Relaunch { agent, argv }
 }
 
-/// One monitor poll: refresh the registry while the agent is alive
-/// (threading the live config commands), then relaunch when
-/// `should_relaunch` fires. Agent-less panes need a registry ref to know
-/// what to relaunch; panes with a known agent but no session fall back
-/// to a valueless/`<agent>-fallback` template when one exists.
 /// One monitor poll. Returns false when the pane no longer exists
 /// (`pane_get` → None) so the caller can count consecutive misses.
-/// Thin I/O shell around the pure `decide_poll`: loads the registry once
-/// and reuses it for refresh + decision.
+/// Thin I/O shell around the pure `decide_poll`.
 fn poll_once(pane_id: &str, config: &Config, cooldown_until: &mut Option<Instant>) -> bool {
     let Some(pane) = herdr::pane_get(pane_id) else {
         return false;
@@ -208,7 +233,12 @@ fn poll_once(pane_id: &str, config: &Config, cooldown_until: &mut Option<Instant
             }
             argv
         }
-        None => vec![],
+        None => {
+            crate::state::append_log(&format!(
+                "monitor {pane_id}: process-info failed; vetoing relaunch"
+            ));
+            vec![]
+        }
     };
     let reg = crate::state::load_registry();
     match decide_poll(&pane, &proc_argv, &reg, config, cooldown_until) {
@@ -227,30 +257,13 @@ fn poll_once(pane_id: &str, config: &Config, cooldown_until: &mut Option<Instant
                 ));
             }
         }
-        PollAction::Nothing => {
-            // The veto passed but no resume argv could be built: log the
-            // agent/value-known state for diagnosability.
-            if should_relaunch(&pane, &proc_argv, *cooldown_until) {
-                let sess = crate::resume::resolve_session_with_commands(
-                    &pane,
-                    reg.get(pane_id),
-                    &proc_argv,
-                    &config.commands,
-                );
-                let agent_name = pane.agent.clone().unwrap_or_else(|| {
-                    sess.as_ref()
-                        .map(|s| s.agent.clone())
-                        .unwrap_or_default()
-                });
-                let known = sess
-                    .as_ref()
-                    .map(|s| !s.value.is_empty())
-                    .unwrap_or(false);
-                crate::state::append_log(&format!(
-                    "monitor {pane_id}: no resume argv for '{agent_name}' (value known: {known})"
-                ));
-            }
+        PollAction::NoResume { agent, value_known } => {
+            let agent_name = agent.unwrap_or_default();
+            crate::state::append_log(&format!(
+                "monitor {pane_id}: no resume argv for '{agent_name}' (value known: {value_known})"
+            ));
         }
+        PollAction::Nothing => {}
     }
     true
 }
@@ -278,7 +291,9 @@ pub fn run(pane_id: &str) {
     if crate::state::live_monitor_pid(pane_id).is_some() {
         return;
     }
-    crate::state::write_monitor_lock(pane_id);
+    if !crate::state::write_monitor_lock(pane_id) {
+        return;
+    }
     // Grace sleep in 1s slices so `stop` takes effect in ~1s instead of
     // after the full `connect_grace_seconds`.
     let own_pid = std::process::id();
@@ -485,7 +500,10 @@ mod tests {
             agent_status: Some("unknown".into()), ..Default::default() };
         assert_eq!(
             decide_poll(&pane, &idle, &HashMap::new(), &config, &None),
-            PollAction::Nothing
+            PollAction::NoResume {
+                agent: None,
+                value_known: false,
+            }
         );
         // resume_argv None: known agent, idle shell, valued template, no
         // value anywhere.
@@ -493,7 +511,159 @@ mod tests {
             agent_status: None, ..Default::default() };
         assert_eq!(
             decide_poll(&pane, &idle, &HashMap::new(), &config, &None),
-            PollAction::Nothing
+            PollAction::NoResume {
+                agent: Some("claude".into()),
+                value_known: false,
+            }
         );
+    }
+
+    #[test]
+    fn partial_corruption_poisons_whole_parse() {
+        // One parseable idle shell + one dropped entry → sentinel pushed,
+        // so the whole parse vetoes (a dropped entry could be a live agent).
+        let info: serde_json::Value = serde_json::from_str(
+            r#"{"foreground_processes":[{"argv":["/usr/bin/zsh"]}, {"foo":1}]}"#,
+        )
+        .expect("fixture parses");
+        let argv = foreground_argv(&info);
+        assert!(argv.contains(&vec!["<unparseable>".to_string()]));
+        let pane = Pane { pane_id: "w1:p1".into(), agent: None,
+            agent_status: Some("unknown".into()), ..Default::default() };
+        assert!(!should_relaunch(&pane, &argv, None));
+    }
+
+    #[test]
+    fn legacy_processes_key_is_rejected() {
+        // Deliberate narrowing: only `foreground_processes` / `argv` are
+        // honored. A legacy `processes` key yields empty (vetoes relaunch).
+        let info: serde_json::Value = serde_json::from_str(
+            r#"{"processes":[{"argv":["/usr/bin/zsh"]}]}"#,
+        )
+        .expect("fixture parses");
+        assert_eq!(foreground_argv(&info), Vec::<Vec<String>>::new());
+    }
+
+    #[test]
+    fn decide_poll_falls_back_to_valueless_kiro_template() {
+        // kiro + idle shell + empty registry + valued primary + valueless
+        // fallback → relaunch via the fallback template.
+        let mut commands = HashMap::new();
+        commands.insert(
+            "kiro".to_string(),
+            "kiro-cli chat --resume-id {value}".to_string(),
+        );
+        commands.insert(
+            "kiro-fallback".to_string(),
+            "kiro-cli chat -r".to_string(),
+        );
+        let config = Config {
+            commands,
+            ..Config::default()
+        };
+        let pane = Pane { pane_id: "w1:p1".into(), agent: Some("kiro".into()),
+            agent_status: Some("unknown".into()), ..Default::default() };
+        let idle = vec![vec!["/usr/bin/zsh".into()]];
+        assert_eq!(
+            decide_poll(&pane, &idle, &HashMap::new(), &config, &None),
+            PollAction::Relaunch {
+                agent: "kiro".into(),
+                argv: vec!["kiro-cli".into(), "chat".into(), "-r".into()],
+            }
+        );
+    }
+
+    use crate::test_support::{lock_env, unique_temp_dir};
+
+    /// Hermetic harness: fake `HERDR_BIN_PATH` + temp state dir (both
+    /// `HERDR_PLUGIN_STATE_DIR` and `HERDR_PLUGIN_CONFIG_DIR` point at it).
+    fn with_poll_harness(script_body: &str, f: impl FnOnce(&std::path::PathBuf)) {
+        let _guard = lock_env();
+        let prev_bin = std::env::var_os("HERDR_BIN_PATH");
+        let prev_state = std::env::var_os("HERDR_PLUGIN_STATE_DIR");
+        let prev_config = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR");
+        let base = unique_temp_dir("monitor-harness");
+        let bin_dir = base.join("bin");
+        std::fs::create_dir_all(&bin_dir).expect("bin dir");
+        let bin_path = bin_dir.join("herdr");
+        std::fs::write(&bin_path, script_body).expect("write fake herdr");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin_path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake herdr");
+        let state_dir = base.join("state");
+        std::fs::create_dir_all(&state_dir).expect("state dir");
+        std::env::set_var("HERDR_BIN_PATH", &bin_path);
+        std::env::set_var("HERDR_PLUGIN_STATE_DIR", &state_dir);
+        std::env::set_var("HERDR_PLUGIN_CONFIG_DIR", &state_dir);
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&state_dir)));
+        match prev_bin {
+            Some(v) => std::env::set_var("HERDR_BIN_PATH", v),
+            None => std::env::remove_var("HERDR_BIN_PATH"),
+        }
+        match prev_state {
+            Some(v) => std::env::set_var("HERDR_PLUGIN_STATE_DIR", v),
+            None => std::env::remove_var("HERDR_PLUGIN_STATE_DIR"),
+        }
+        match prev_config {
+            Some(v) => std::env::set_var("HERDR_PLUGIN_CONFIG_DIR", v),
+            None => std::env::remove_var("HERDR_PLUGIN_CONFIG_DIR"),
+        }
+        std::fs::remove_dir_all(&base).ok();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn poll_once_refresh_remembers_session() {
+        let script = "#!/bin/sh\nif [ \"$1\" = \"pane\" ] && [ \"$2\" = \"get\" ]; then\necho '{\"id\":\"cli:pane:get\",\"result\":{\"pane\":{\"pane_id\":\"w1:p1\",\"agent\":\"claude\",\"agent_status\":\"working\",\"agent_session\":{\"agent\":\"claude\",\"value\":\"live-1\"}}}}'\nexit 0\nfi\nif [ \"$1\" = \"pane\" ] && [ \"$2\" = \"process-info\" ]; then\necho '{\"id\":\"cli:pane:process-info\",\"result\":{\"process_info\":{\"foreground_processes\":[{\"argv\":[\"claude\",\"--resume\",\"live-1\"]}]}}}'\nexit 0\nfi\nexit 1\n";
+        with_poll_harness(script, |_| {
+            let config = Config::default();
+            let mut cooldown: Option<Instant> = None;
+            assert!(poll_once("w1:p1", &config, &mut cooldown));
+            assert_eq!(cooldown, None);
+            let reg = crate::state::load_registry();
+            assert_eq!(reg.get("w1:p1").expect("session remembered").value, "live-1");
+        });
+    }
+
+    #[test]
+    fn poll_once_relaunch_sets_cooldown() {
+        let script = "#!/bin/sh\nif [ \"$1\" = \"pane\" ] && [ \"$2\" = \"get\" ]; then\necho '{\"id\":\"cli:pane:get\",\"result\":{\"pane\":{\"pane_id\":\"w1:p1\",\"agent_status\":\"unknown\"}}}'\nexit 0\nfi\nif [ \"$1\" = \"pane\" ] && [ \"$2\" = \"process-info\" ]; then\necho '{\"id\":\"cli:pane:process-info\",\"result\":{\"process_info\":{\"foreground_processes\":[{\"argv\":[\"/usr/bin/zsh\"]}]}}}'\nexit 0\nfi\nif [ \"$1\" = \"pane\" ] && [ \"$2\" = \"run\" ]; then\necho '{\"id\":\"cli:pane:run\",\"result\":{\"ok\":true}}'\nexit 0\nfi\nexit 1\n";
+        with_poll_harness(script, |state_dir| {
+            crate::state::remember(
+                "w1:p1",
+                SessionRef {
+                    agent: "claude".into(),
+                    value: "abc-123".into(),
+                },
+            );
+            let config = Config::default();
+            let mut cooldown: Option<Instant> = None;
+            assert!(poll_once("w1:p1", &config, &mut cooldown));
+            assert!(cooldown.is_some(), "successful relaunch sets cooldown");
+            let log = std::fs::read_to_string(state_dir.join("log.txt"))
+                .expect("log exists");
+            assert!(log.contains("relaunched claude"), "log names agent: {log}");
+        });
+    }
+
+    #[test]
+    fn finish_monitor_clears_lock_and_sentinel() {
+        with_poll_harness("#!/bin/sh\nexit 1\n", |_| {
+            let pane_id = "w1:p1";
+            let own_pid = 424243u32;
+            assert!(crate::state::write_monitor_lock_pid(pane_id, own_pid));
+            std::fs::write(crate::state::stop_sentinel_path(own_pid), b"stop")
+                .expect("sentinel");
+            finish_monitor(pane_id, own_pid);
+            assert!(
+                !crate::state::monitor_lock_path(pane_id).exists(),
+                "lock cleared"
+            );
+            assert!(
+                !crate::state::stop_sentinel_path(own_pid).exists(),
+                "sentinel cleared"
+            );
+        });
     }
 }

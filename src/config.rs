@@ -42,6 +42,16 @@ impl Default for Config {
     }
 }
 
+/// Default resume templates. `{value}` marks session-valued templates.
+///
+/// Sync debt: `kiro` and `kiro-fallback` must stay in sync with
+/// `resume.rs` — `<agent>-fallback` is preferred when no session value is
+/// known (`resume_argv`), and the `kiro` template's resume flag feeds argv
+/// session recovery (`session_from_argv_with_commands`, which also accepts
+/// the live-CLI `--resume` spelling alongside `--resume-id`). Drop the
+/// `-r` (`kiro-cli chat -r`) alt spelling only when kiro-cli removes it or
+/// the valued `kiro` template always resolves (making the valueless path
+/// dead); per-user opt-out is `"kiro-fallback": ""` in `config.json`.
 pub fn default_commands() -> HashMap<String, String> {
     HashMap::from([
         ("claude".into(), "claude --resume {value}".into()),
@@ -145,40 +155,24 @@ pub fn state_dir() -> PathBuf {
     home.join(".config/herdr/plugins/config/quinnjr.auto-resume")
 }
 
+/// Shared helpers for this module's env-mutating tests. The lock and temp
+/// dir come from the crate-wide `crate::test_support` (one lock serializes
+/// ALL modules' env mutation); `with_saved_env` keeps this module's
+/// save/restore-everything semantics.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
+mod test_support {
+    use std::path::PathBuf;
 
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    /// Serializes the config tests: they mutate the process-global
-    /// `HERDR_PLUGIN_CONFIG_DIR` / `HERDR_PLUGIN_STATE_DIR`, so they must
-    /// never run concurrently. (Poison-tolerant: a failed test must not
-    /// wedge the rest.)
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    pub fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        crate::test_support::lock_env()
     }
 
-    fn unique_temp_dir() -> PathBuf {
-        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!(
-            "auto-resume-config-test-{}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0),
-            n
-        ));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        dir
+    pub fn unique_temp_dir() -> PathBuf {
+        crate::test_support::unique_temp_dir("config-test")
     }
 
     /// Save both env vars, run `f` under the lock, then restore.
-    fn with_saved_env(f: impl FnOnce()) {
+    pub fn with_saved_env(f: impl FnOnce()) {
         let _guard = lock_env();
         let prev_config = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR");
         let prev_state = std::env::var_os("HERDR_PLUGIN_STATE_DIR");
@@ -193,6 +187,12 @@ mod tests {
         }
         assert!(result.is_ok());
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::test_support::{unique_temp_dir, with_saved_env};
 
     #[test]
     fn load_clamps_poll_and_grace() {

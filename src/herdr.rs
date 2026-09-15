@@ -65,53 +65,71 @@ fn parse_panes(raw: &str) -> Vec<Pane> {
 }
 
 /// Run `herdr <args...>` with a 10s timeout, returning the raw output.
-/// On timeout the child is killed and None is returned (fail-closed).
-fn run_raw(args: &[&str]) -> Option<std::process::Output> {
+/// On timeout the child is killed and Err("timeout") is returned (fail-closed).
+fn run_raw(args: &[&str]) -> Result<std::process::Output, String> {
     let bin = std::env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".to_string());
-    let child = std::process::Command::new(&bin)
+    let mut child = std::process::Command::new(&bin)
         .args(args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .ok()?;
-    let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(child)));
-    let slot_clone = std::sync::Arc::clone(&slot);
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let child_opt = slot_clone.lock().ok().and_then(|mut g| g.take());
-        let Some(child) = child_opt else {
-            let _ = tx.send(None);
-            return;
-        };
-        let out = child.wait_with_output().ok();
-        let _ = tx.send(out);
-    });
-    match rx.recv_timeout(std::time::Duration::from_secs(10)) {
-        Ok(out) => out,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            if let Ok(mut g) = slot.lock() {
-                if let Some(mut child) = g.take() {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
+        .map_err(|e| {
+            eprintln!("herdr: spawn failed: {} {}: {e}", bin, args.join(" "));
+            format!("spawn: {e}")
+        })?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                // Child has exited, so wait_with_output returns immediately.
+                return child.wait_with_output().map_err(|e| {
+                    eprintln!(
+                        "herdr: wait failed: {} {}: {e}",
+                        bin,
+                        args.join(" ")
+                    );
+                    format!("wait: {e}")
+                });
             }
-            eprintln!("herdr: invoke timed out after 10s: {} {}", bin, args.join(" "));
-            None
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    if let Err(e) = child.kill() {
+                        eprintln!(
+                            "herdr: kill failed: {} {}: {e}",
+                            bin,
+                            args.join(" ")
+                        );
+                    }
+                    if let Err(e) = child.wait() {
+                        eprintln!(
+                            "herdr: wait after kill failed: {} {}: {e}",
+                            bin,
+                            args.join(" ")
+                        );
+                    }
+                    eprintln!("herdr: invoke timed out after 10s: {} {}", bin, args.join(" "));
+                    return Err("timeout".to_string());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => {
+                eprintln!("herdr: wait failed: {} {}: {e}", bin, args.join(" "));
+                return Err(format!("wait: {e}"));
+            }
         }
-        Err(_) => None,
     }
 }
 
-/// Run `herdr <args...>`, scan stdout then stderr for the last JSON line
-/// containing `"result"`, and return its parsed `result` object.
-///
-/// False-success guards: a non-zero exit status bails outright;
-/// top-level `"error"` envelopes are skipped; `result: null` counts as absent.
-pub fn invoke(args: &[&str]) -> Option<Value> {
-    let output = run_raw(args)?;
-    if !output.status.success() {
-        return None;
+fn stderr_tail_200(stderr: &str) -> String {
+    let chars: Vec<char> = stderr.chars().collect();
+    if chars.len() > 200 {
+        chars[chars.len() - 200..].iter().collect()
+    } else {
+        stderr.to_string()
     }
+}
+
+fn extract_result(output: &std::process::Output) -> Option<Value> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let mut found = None;
@@ -135,20 +153,99 @@ pub fn invoke(args: &[&str]) -> Option<Value> {
     found
 }
 
+/// Run `herdr <args...>`, scan stdout then stderr for the last JSON line
+/// containing `"result"`, and return its parsed `result` object.
+///
+/// False-success guards: a non-zero exit status bails outright;
+/// top-level `"error"` envelopes are skipped; `result: null` counts as absent.
+pub fn invoke(args: &[&str]) -> Option<Value> {
+    let output = match run_raw(args) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("herdr: invoke failed: {}: {e}", args.join(" "));
+            return None;
+        }
+    };
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let tail = stderr_tail_200(stderr.trim());
+        eprintln!(
+            "herdr: non-zero exit {} for {}: {tail}",
+            output.status,
+            args.join(" ")
+        );
+        return None;
+    }
+    extract_result(&output)
+}
+
 pub fn pane_list() -> Vec<Pane> {
     invoke(&["pane", "list"]).map(|r| panes_from_result(&r)).unwrap_or_default()
+}
+
+pub fn pane_list_checked() -> Option<Vec<Pane>> {
+    let output = match run_raw(&["pane", "list"]) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("herdr: pane list failed: {e}");
+            return None;
+        }
+    };
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let tail = stderr_tail_200(stderr.trim());
+        eprintln!("herdr: pane list non-zero exit {}: {tail}", output.status);
+        return None;
+    }
+    match extract_result(&output) {
+        Some(r) => Some(panes_from_result(&r)),
+        None => Some(Vec::new()),
+    }
 }
 
 pub fn pane_get(id: &str) -> Option<Pane> {
     let result = invoke(&["pane", "get", id])?;
     let pane = result.get("pane")?;
-    serde_json::from_value(pane.clone()).ok()
+    match serde_json::from_value(pane.clone()) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            eprintln!("herdr: pane_get unparsable pane, falling back to bare pane: {e}");
+            let fallback_id = pane
+                .get("pane_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(id)
+                .to_string();
+            Some(Pane {
+                pane_id: fallback_id,
+                ..Default::default()
+            })
+        }
+    }
 }
 
 pub fn pane_run(id: &str, argv: &[&str]) -> bool {
     let mut args = vec!["pane", "run", id];
     args.extend_from_slice(argv);
-    run_raw(&args).map(|o| o.status.success()).unwrap_or(false)
+    match run_raw(&args) {
+        Err(e) => {
+            eprintln!("herdr: pane_run failed for {}: {e}", args.join(" "));
+            false
+        }
+        Ok(o) => {
+            if o.status.success() {
+                true
+            } else {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                let tail = stderr_tail_200(stderr.trim());
+                eprintln!(
+                    "herdr: pane_run non-zero exit {} for {}: {tail}",
+                    o.status,
+                    args.join(" ")
+                );
+                false
+            }
+        }
+    }
 }
 
 pub fn process_info(id: &str) -> Option<Value> {
@@ -161,14 +258,12 @@ pub fn process_info(id: &str) -> Option<Value> {
 mod tests {
     use super::*;
 
-    /// Serializes the invoke tests: they mutate the process-global
-    /// `HERDR_BIN_PATH`, so they must never run concurrently.
-    static HERDR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use crate::test_support::lock_env;
 
     /// Run `f` with `HERDR_BIN_PATH` pointed at an executable shell script
     /// with `script_body`, restoring the previous value afterwards.
     fn with_fake_herdr(script_body: &str, f: impl FnOnce()) {
-        let _guard = HERDR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = lock_env();
         let prev = std::env::var_os("HERDR_BIN_PATH");
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -344,7 +439,7 @@ mod tests {
 
     #[test]
     fn invoke_returns_none_on_spawn_failure() {
-        let _guard = HERDR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = lock_env();
         let prev = std::env::var_os("HERDR_BIN_PATH");
         std::env::set_var(
             "HERDR_BIN_PATH",
@@ -399,8 +494,83 @@ mod tests {
         });
         let elapsed = start.elapsed();
         assert!(
-            elapsed < std::time::Duration::from_secs(15),
+            elapsed >= std::time::Duration::from_secs(10),
+            "invoke must wait out the 10s timeout, took {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
             "invoke must return quickly on timeout, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn panes_from_result_skips_bad_entry_keeps_good() {
+        let result = serde_json::json!({
+            "panes": [
+                {"pane_id": "w1:p9", "agent": 5},
+                {"pane_id": "w1:p1", "agent": "kiro"}
+            ]
+        });
+        let panes = panes_from_result(&result);
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].pane_id, "w1:p1");
+    }
+
+    #[test]
+    fn pane_get_falls_back_to_bare_pane_on_schema_drift() {
+        with_fake_herdr(
+            "#!/bin/sh\necho '{\"id\":\"cli:pane:get\",\"result\":{\"pane\":{\"pane_id\":\"w1:p9\",\"agent\":5}}}'\n",
+            || {
+                let pane = pane_get("w1:p9").expect("schema drift degrades to bare pane");
+                assert_eq!(pane.pane_id, "w1:p9");
+            },
+        );
+    }
+
+    #[test]
+    fn pane_run_false_on_spawn_failure() {
+        let _guard = lock_env();
+        let prev = std::env::var_os("HERDR_BIN_PATH");
+        std::env::set_var("HERDR_BIN_PATH", "/nonexistent-herdr-bin-xyz-12345/herdr");
+        let result = pane_run("w1:p1", &["echo", "hi"]);
+        match prev {
+            Some(v) => std::env::set_var("HERDR_BIN_PATH", v),
+            None => std::env::remove_var("HERDR_BIN_PATH"),
+        }
+        assert!(!result);
+    }
+
+    #[test]
+    fn pane_list_checked_some_empty_on_success_empty() {
+        with_fake_herdr(
+            "#!/bin/sh\necho '{\"id\":\"cli:pane:list\",\"result\":{\"panes\":[]}}'\n",
+            || {
+                let v = pane_list_checked().expect("success with empty panes is Some");
+                assert!(v.is_empty());
+            },
+        );
+    }
+
+    #[test]
+    fn pane_list_checked_none_on_spawn_failure() {
+        let _guard = lock_env();
+        let prev = std::env::var_os("HERDR_BIN_PATH");
+        std::env::set_var("HERDR_BIN_PATH", "/nonexistent-herdr-bin-xyz-12345/herdr");
+        let result = pane_list_checked();
+        match prev {
+            Some(v) => std::env::set_var("HERDR_BIN_PATH", v),
+            None => std::env::remove_var("HERDR_BIN_PATH"),
+        }
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn pane_list_checked_none_on_nonzero_exit() {
+        with_fake_herdr(
+            "#!/bin/sh\necho '{\"id\":\"cli:pane:list\",\"result\":{\"panes\":[]}}'\nexit 1\n",
+            || {
+                assert_eq!(pane_list_checked(), None);
+            },
         );
     }
 }

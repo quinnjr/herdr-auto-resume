@@ -18,12 +18,54 @@ fn log_path() -> PathBuf {
 
 /// Load the durable pane-id -> session registry. Missing file, unreadable
 /// file, or invalid JSON yields an empty map.
+///
+/// One-shot auto-migration: when the target `state_dir()/registry.json` is
+/// absent but `$HERDR_PLUGIN_CONFIG_DIR/registry.json` exists at a different
+/// path, the legacy file is copied over before loading.
 pub fn load_registry() -> HashMap<String, SessionRef> {
-    let text = match std::fs::read_to_string(registry_path()) {
+    let target = registry_path();
+    if !target.exists() {
+        if let Some(cfg_dir) = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR") {
+            let src = PathBuf::from(cfg_dir).join("registry.json");
+            if src != target && src.exists() {
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent).ok();
+                }
+                match std::fs::copy(&src, &target) {
+                    Ok(_) => eprintln!(
+                        "load_registry: migrated registry from {} to {}",
+                        src.display(),
+                        target.display()
+                    ),
+                    Err(e) => eprintln!(
+                        "load_registry: migration from {} failed: {e}",
+                        src.display()
+                    ),
+                }
+            }
+        }
+    }
+    let text = match std::fs::read_to_string(&target) {
         Ok(t) => t,
         Err(_) => return HashMap::new(),
     };
-    serde_json::from_str(&text).unwrap_or_default()
+    // Tolerant loader: a single bad entry must not wipe the whole map.
+    let raw: HashMap<String, serde_json::Value> = match serde_json::from_str(&text) {
+        Ok(m) => m,
+        Err(_) => return HashMap::new(),
+    };
+    let mut out = HashMap::new();
+    for (k, v) in raw {
+        match serde_json::from_value::<SessionRef>(v) {
+            Ok(s) => {
+                out.insert(k, s);
+            }
+            Err(e) => {
+                eprintln!("load_registry: skipping bad entry for {k:?}: {e}");
+            }
+        }
+    }
+    out
 }
 
 /// Persist the registry atomically via `registry.json.tmp` + rename.
@@ -40,14 +82,27 @@ pub fn save_registry(reg: &HashMap<String, SessionRef>) {
 
 /// Record (or overwrite) the session for a pane, persisting to disk.
 /// Skips the write when the stored value is unchanged (monitors call this
-/// every poll while the agent is alive).
+/// every poll while the agent is alive). Refuses unsafe session values.
 pub fn remember(pane_id: &str, session: SessionRef) {
+    if !is_safe_session_value(&session.value) {
+        eprintln!("remember: refusing unsafe session value for pane {pane_id:?}");
+        return;
+    }
     let mut reg = load_registry();
     if reg.get(pane_id) == Some(&session) {
         return;
     }
     reg.insert(pane_id.to_string(), session);
     save_registry(&reg);
+}
+
+use crate::resume::is_safe_session_value;
+
+/// Legacy lock-file path (`:` -> `_`), kept for migration from the
+/// pre-encoding layout. New code writes via [`monitor_lock_path`]; reads
+/// fall back here when the new path is absent.
+fn legacy_monitor_lock_path(pane_id: &str) -> PathBuf {
+    monitors_dir().join(format!("{}.json", pane_id.replace(':', "_")))
 }
 
 /// Pane ids accepted for lock-file handling: nonempty, at most 128
@@ -114,6 +169,39 @@ pub fn write_monitor_lock_pid(pane_id: &str, pid: u32) -> bool {
             return false;
         }
     }
+    let legacy = legacy_monitor_lock_path(pane_id);
+    // Legacy migration: when only the legacy file exists, a live rival keeps
+    // its claim (return false, files untouched); a stale/corrupt legacy file
+    // is renamed to the new name so the normal reclaim path below handles it.
+    if legacy != path && !path.exists() && legacy.exists() {
+        match std::fs::read_to_string(&legacy) {
+            Ok(legacy_text) => match parse_lock_text(&legacy_text) {
+                Ok((locked_pane, legacy_pid)) => {
+                    if locked_pane == pane_id && pid_is_monitor_for_pane(legacy_pid, pane_id)
+                    {
+                        return false;
+                    }
+                    eprintln!("write_monitor_lock: migrating legacy lock for {pane_id:?}");
+                    std::fs::rename(&legacy, &path).ok();
+                }
+                Err(kind) => {
+                    eprintln!(
+                        "write_monitor_lock: corrupt legacy {}: {kind}",
+                        legacy.display()
+                    );
+                    if std::fs::rename(&legacy, &path).is_err() {
+                        std::fs::remove_file(&legacy).ok();
+                    }
+                }
+            },
+            Err(e) => {
+                eprintln!(
+                    "write_monitor_lock: unreadable legacy {}: {e}",
+                    legacy.display()
+                );
+            }
+        }
+    }
     // pane_id is embedded so the liveness check can verify the process
     // is the monitor for THIS pane (guards against PID reuse by a
     // monitor for another pane or an unrelated same-named binary).
@@ -129,6 +217,9 @@ pub fn write_monitor_lock_pid(pane_id: &str, pid: u32) -> bool {
                 eprintln!("write_monitor_lock: write {} failed: {e}", path.display());
                 return false;
             }
+            if legacy != path {
+                std::fs::remove_file(&legacy).ok();
+            }
             true
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -142,6 +233,9 @@ pub fn write_monitor_lock_pid(pane_id: &str, pid: u32) -> bool {
                             path.display()
                         );
                         return false;
+                    }
+                    if legacy != path {
+                        std::fs::remove_file(&legacy).ok();
                     }
                     true
                 }
@@ -158,13 +252,18 @@ pub fn write_monitor_lock_pid(pane_id: &str, pid: u32) -> bool {
 }
 
 /// Remove a pane's monitor lock. Best-effort; invalid ids are rejected
-/// without touching the filesystem.
+/// without touching the filesystem. Removes both the new encoded path and
+/// any leftover legacy path.
 pub fn clear_monitor_lock(pane_id: &str) {
     if !valid_pane_id(pane_id) {
         eprintln!("clear_monitor_lock: rejected invalid pane id {pane_id:?}");
         return;
     }
     std::fs::remove_file(monitor_lock_path(pane_id)).ok();
+    let legacy = legacy_monitor_lock_path(pane_id);
+    if legacy != monitor_lock_path(pane_id) {
+        std::fs::remove_file(legacy).ok();
+    }
 }
 
 /// Parse one lock file's contents: `Ok((pane_id, pid))`, or `Err(kind)`
@@ -252,14 +351,42 @@ fn lock_record(pane_id: &str) -> Option<(u32, Option<String>)> {
         eprintln!("live_monitor_pid: rejected invalid pane id {pane_id:?}");
         return None;
     }
-    let text = std::fs::read_to_string(monitor_lock_path(pane_id)).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-    let pid = v.get("pid")?.as_u64().map(|p| p as u32)?;
-    let locked_pane = v
-        .get("pane_id")
-        .and_then(|p| p.as_str())
-        .map(str::to_string);
-    Some((pid, locked_pane))
+    let new_path = monitor_lock_path(pane_id);
+    if new_path.exists() {
+        let text = match std::fs::read_to_string(&new_path) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!(
+                    "live_monitor_pid: unreadable {}: {e}",
+                    new_path.display()
+                );
+                return None;
+            }
+        };
+        return match parse_lock_text(&text) {
+            Ok((locked_pane, pid)) => Some((pid, Some(locked_pane))),
+            Err(kind) => {
+                eprintln!(
+                    "live_monitor_pid: corrupt {}: {kind}",
+                    new_path.display()
+                );
+                None
+            }
+        };
+    }
+    // Fall back to the legacy filename when the new encoded path is absent.
+    let legacy = legacy_monitor_lock_path(pane_id);
+    if legacy == new_path {
+        return None;
+    }
+    let text = std::fs::read_to_string(&legacy).ok()?;
+    match parse_lock_text(&text) {
+        Ok((locked_pane, pid)) => Some((pid, Some(locked_pane))),
+        Err(kind) => {
+            eprintln!("live_monitor_pid: corrupt {}: {kind}", legacy.display());
+            None
+        }
+    }
 }
 
 /// PID of the live monitor for a pane, or `None` when no lock exists, the
@@ -388,46 +515,28 @@ pub fn append_log(line: &str) {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use crate::test_support::{lock_env, unique_temp_dir};
 
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    /// Serializes the state tests: they all mutate the process-global
-    /// `HERDR_PLUGIN_CONFIG_DIR`, so they must never run concurrently.
-    /// (Poison-tolerant: a failed test must not wedge the rest.)
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    fn unique_temp_dir() -> PathBuf {
-        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!(
-            "auto-resume-state-test-{}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0),
-            n
-        ));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        dir
-    }
-
-    /// Run `f` with `HERDR_PLUGIN_CONFIG_DIR` pointed at a fresh temp dir,
-    /// restoring the previous value afterwards (env mutation is
-    /// process-global). Returns the temp dir for post-assertions.
+    /// Run `f` with plugin dirs pinned at a fresh temp dir (CONFIG) and
+    /// STATE_DIR removed, restoring both afterwards. Pinning both makes
+    /// state resolution deterministic regardless of ambient env or other
+    /// modules' tests (all env mutation shares one crate-wide lock).
+    /// Returns the temp dir for post-assertions.
     fn with_temp_state_dir(f: impl FnOnce(&PathBuf)) -> PathBuf {
         let _guard = lock_env();
-        let prev = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR");
-        let dir = unique_temp_dir();
+        let prev_config = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR");
+        let prev_state = std::env::var_os("HERDR_PLUGIN_STATE_DIR");
+        let dir = unique_temp_dir("state-test");
         std::env::set_var("HERDR_PLUGIN_CONFIG_DIR", &dir);
+        std::env::remove_var("HERDR_PLUGIN_STATE_DIR");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&dir)));
-        match prev {
+        match prev_config {
             Some(v) => std::env::set_var("HERDR_PLUGIN_CONFIG_DIR", v),
             None => std::env::remove_var("HERDR_PLUGIN_CONFIG_DIR"),
+        }
+        match prev_state {
+            Some(v) => std::env::set_var("HERDR_PLUGIN_STATE_DIR", v),
+            None => std::env::remove_var("HERDR_PLUGIN_STATE_DIR"),
         }
         assert!(result.is_ok());
         dir
@@ -719,6 +828,184 @@ mod tests {
             let text = std::fs::read_to_string(dir.join("log.txt")).expect("log exists");
             assert!(text.contains("hello"));
             assert!(text.starts_with('['));
+        });
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Spawn a sleeper whose argv[0] carries the monitor marker plus
+    /// `monitor <pane_id>` tokens, so `pid_is_monitor_for_pane` accepts it.
+    /// argv[0] may contain spaces (split on space counts), so `sleep` still
+    /// sees a valid duration in argv[1] and stays alive.
+    fn spawn_fake_monitor(pane_id: &str) -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+        let marker = our_binary_marker();
+        let fake_arg0 = format!("{marker} monitor {pane_id}");
+        std::process::Command::new("sleep")
+            .arg("60")
+            .arg0(fake_arg0)
+            .spawn()
+            .expect("spawn sleep")
+    }
+
+    #[test]
+    fn legacy_lock_file_resolves_and_migrates() {
+        let dir = with_temp_state_dir(|dir| {
+            let pane = "w7G:p1";
+            let mut child = spawn_fake_monitor(pane);
+            let pid = child.id();
+            // Write legacy-format lock file only (colon -> underscore).
+            let legacy = dir.join("monitors/w7G_p1.json");
+            std::fs::create_dir_all(legacy.parent().unwrap()).expect("monitors dir");
+            let text =
+                serde_json::json!({ "pid": pid, "pane_id": pane }).to_string();
+            std::fs::write(&legacy, &text).expect("legacy lock");
+            assert!(!monitor_lock_path(pane).exists());
+            // Live legacy lock resolves through the fallback.
+            assert_eq!(live_monitor_pid(pane), Some(pid));
+            child.kill().ok();
+            child.wait().ok();
+            // Stale legacy lock is reclaimed: rename legacy -> new + overwrite.
+            assert!(write_monitor_lock_pid(pane, 2147483646));
+            assert!(!legacy.exists(), "legacy file must migrate away");
+            assert!(monitor_lock_path(pane).exists());
+            assert_eq!(
+                monitor_locks(),
+                vec![(pane.to_string(), 2147483646)]
+            );
+        });
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn registry_auto_migrates_from_config_dir() {
+        let _guard = lock_env();
+        let prev_config = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR");
+        let prev_state = std::env::var_os("HERDR_PLUGIN_STATE_DIR");
+        let src_dir = unique_temp_dir("state-test");
+        let dst_dir = unique_temp_dir("state-test");
+        std::env::set_var("HERDR_PLUGIN_CONFIG_DIR", &src_dir);
+        std::env::set_var("HERDR_PLUGIN_STATE_DIR", &dst_dir);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let src_reg = src_dir.join("registry.json");
+            std::fs::write(
+                &src_reg,
+                r#"{"w7G:p1":{"agent":"kiro","value":"sess-1"}}"#,
+            )
+            .expect("legacy registry");
+            assert!(!dst_dir.join("registry.json").exists());
+            let reg = load_registry();
+            assert_eq!(reg["w7G:p1"].value, "sess-1");
+            assert!(dst_dir.join("registry.json").exists());
+            // Second load is a no-op (target now present).
+            let reg2 = load_registry();
+            assert_eq!(reg2["w7G:p1"].value, "sess-1");
+        }));
+        match prev_config {
+            Some(v) => std::env::set_var("HERDR_PLUGIN_CONFIG_DIR", v),
+            None => std::env::remove_var("HERDR_PLUGIN_CONFIG_DIR"),
+        }
+        match prev_state {
+            Some(v) => std::env::set_var("HERDR_PLUGIN_STATE_DIR", v),
+            None => std::env::remove_var("HERDR_PLUGIN_STATE_DIR"),
+        }
+        std::fs::remove_dir_all(&src_dir).ok();
+        std::fs::remove_dir_all(&dst_dir).ok();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn load_registry_keeps_good_entries_skips_bad() {
+        let dir = with_temp_state_dir(|dir| {
+            std::fs::write(
+                dir.join("registry.json"),
+                r#"{"good":{"agent":"kiro","value":"sess-1"},"bad":123}"#,
+            )
+            .expect("mixed registry");
+            let reg = load_registry();
+            assert_eq!(reg["good"].value, "sess-1");
+            assert!(!reg.contains_key("bad"));
+        });
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn remember_refuses_unsafe_session_values() {
+        let dir = with_temp_state_dir(|dir| {
+            remember(
+                "w7G:p1",
+                SessionRef {
+                    agent: "claude".into(),
+                    value: "bad;value".into(),
+                },
+            );
+            assert!(
+                load_registry().is_empty(),
+                "unsafe value must not be persisted"
+            );
+            assert!(
+                !dir.join("registry.json").exists(),
+                "no registry file for refused write"
+            );
+            remember(
+                "w7G:p1",
+                SessionRef {
+                    agent: "claude".into(),
+                    value: "".into(),
+                },
+            );
+            assert!(load_registry().is_empty());
+            // Safe values still persist.
+            remember(
+                "w7G:p1",
+                SessionRef {
+                    agent: "claude".into(),
+                    value: "sess-1".into(),
+                },
+            );
+            assert_eq!(load_registry()["w7G:p1"].value, "sess-1");
+        });
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unreadable_locks_reports_missing_fields() {
+        let dir = with_temp_state_dir(|dir| {
+            std::fs::create_dir_all(dir.join("monitors")).expect("monitors dir");
+            std::fs::write(
+                dir.join("monitors/missing-pid.json"),
+                r#"{"pane_id":"w7G:p1"}"#,
+            )
+            .expect("missing pid");
+            std::fs::write(dir.join("monitors/missing-pane.json"), r#"{"pid":123}"#)
+                .expect("missing pane_id");
+            let bad = unreadable_locks();
+            assert!(bad.iter().any(|n| n == "missing-pid.json"));
+            assert!(bad.iter().any(|n| n == "missing-pane.json"));
+            assert!(monitor_locks().is_empty());
+            // Fail-closed: neither resolves to a live pid.
+            assert_eq!(live_monitor_pid("w7G:p1"), None);
+        });
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn monitor_lock_claim_rejects_live_rival() {
+        let dir = with_temp_state_dir(|_| {
+            let pane = "w7G:p1";
+            let mut child = spawn_fake_monitor(pane);
+            let pid = child.id();
+            assert!(write_monitor_lock_pid(pane, pid));
+            let before =
+                std::fs::read_to_string(monitor_lock_path(pane)).expect("lock exists");
+            // Second claim loses to the live rival; file untouched.
+            assert!(!write_monitor_lock_pid(pane, 2147483647));
+            let after =
+                std::fs::read_to_string(monitor_lock_path(pane)).expect("lock exists");
+            assert_eq!(before, after);
+            let v: serde_json::Value = serde_json::from_str(&after).expect("valid");
+            assert_eq!(v["pid"].as_u64().unwrap() as u32, pid);
+            child.kill().ok();
+            child.wait().ok();
         });
         std::fs::remove_dir_all(&dir).ok();
     }
