@@ -48,11 +48,19 @@ pub fn should_relaunch(
 }
 
 /// Extract foreground argv vectors from a `process-info` result object.
-/// Best-effort across shapes (`foreground` / `processes` lists of
-/// `{argv: [...]}` or bare argv arrays, or a single `argv`). Unknown
-/// shape yields empty (which vetoes relaunch — fail closed).
+/// Best-effort across shapes (`foreground_processes` — the live shape on
+/// this host — plus `foreground` / `processes` / `process_list` /
+/// `children` lists of `{argv: [...]}` or bare argv arrays, or a single
+/// `argv`). Unknown shape yields empty (which vetoes relaunch — fail
+/// closed; the caller logs the shape for diagnosability).
 fn foreground_argv(info: &serde_json::Value) -> Vec<Vec<String>> {
-    for key in ["foreground", "processes", "process_list", "children"] {
+    for key in [
+        "foreground_processes",
+        "foreground",
+        "processes",
+        "process_list",
+        "children",
+    ] {
         if let Some(v) = info.get(key) {
             let out = argv_list_from(v);
             if !out.is_empty() {
@@ -99,9 +107,29 @@ fn poll_once(pane_id: &str, config: &Config, cooldown_until: &mut Option<Instant
     let Some(pane) = herdr::pane_get(pane_id) else {
         return;
     };
-    let proc_argv = herdr::process_info(pane_id)
-        .map(|v| foreground_argv(&v))
-        .unwrap_or_default();
+    let proc_argv = match herdr::process_info(pane_id) {
+        Some(v) => {
+            let argv = foreground_argv(&v);
+            if argv.is_empty() {
+                // Fail-closed AND diagnosable: record the shape we saw
+                // so future `process-info` drift shows up in the log.
+                let keys = v
+                    .as_object()
+                    .map(|o| {
+                        o.keys()
+                            .map(String::as_str)
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    })
+                    .unwrap_or_else(|| "<non-object>".to_string());
+                crate::state::append_log(&format!(
+                    "monitor {pane_id}: empty foreground parse; keys={keys}"
+                ));
+            }
+            argv
+        }
+        None => vec![],
+    };
     if pane.agent.is_some() {
         let reg = crate::state::load_registry();
         if let Some(sess) = crate::resume::resolve_session_with_commands(
@@ -162,14 +190,33 @@ fn poll_once(pane_id: &str, config: &Config, cooldown_until: &mut Option<Instant
     }
 }
 
-/// Monitor loop for one pane: sleep `connect_grace_seconds` (the pane
-/// may still be connecting after restore), then poll every
-/// `poll_seconds` until a `stop-<pid>` sentinel appears for our pid.
+/// Monitor loop for one pane: claim the monitor lock FIRST, then sleep
+/// `connect_grace_seconds` (the pane may still be connecting after
+/// restore), then poll every `poll_seconds` until a `stop-<pid>` sentinel
+/// appears for our pid.
+///
+/// Lock-then-sleep (not sleep-then-lock): the lock is visible during the
+/// long grace sleep, so a racing second monitor — and `supervise-all` —
+/// sees it via `live_monitor_pid` instead of double-spawning. A
+/// simultaneous-start race (both check before either writes) remains but
+/// is millisecond-narrow instead of grace-seconds-wide.
 pub fn run(pane_id: &str) {
     let config = crate::config::load();
-    std::thread::sleep(Duration::from_secs(config.connect_grace_seconds));
+    if crate::state::live_monitor_pid(pane_id).is_some() {
+        return;
+    }
     crate::state::write_monitor_lock(pane_id);
+    // Grace sleep in 1s slices so `stop` takes effect in ~1s instead of
+    // after the full `connect_grace_seconds`.
     let own_pid = std::process::id();
+    for _ in 0..config.connect_grace_seconds {
+        if crate::state::stop_requested(own_pid) {
+            crate::state::clear_monitor_lock(pane_id);
+            crate::state::clear_stop_sentinel(own_pid);
+            return;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
     let mut cooldown_until: Option<Instant> = None;
     loop {
         if crate::state::stop_requested(own_pid) {
@@ -208,5 +255,40 @@ mod tests {
             agent_status: Some("unknown".into()), ..Default::default() };
         let argv = vec![vec!["/bin/sh".into(), "myscript.sh".into()]];
         assert!(!should_relaunch(&pane, &argv, None));
+    }
+
+    /// Live `herdr pane process-info` shape captured on this machine
+    /// (2026-09-15, kiro agent pane `w7G:p1`): the result's
+    /// `process_info` object carries `foreground_processes: [{argv, ...}]`.
+    /// This is the primary session/decision source — the parser must
+    /// handle this exact shape.
+    #[test]
+    fn foreground_argv_parses_live_process_info_shape() {
+        let info: serde_json::Value = serde_json::from_str(
+            r#"{"foreground_process_group_id":51024,"foreground_processes":[{"argv":["kiro-cli","--resume"],"cmdline":"kiro-cli --resume","cwd":"/home/joseph/Projects/Lexmata/lexmata-litify-integration","name":"kiro-cli","pid":51024},{"argv":["/home/joseph/.local/bin/kiro-cli-chat","chat","--resume"],"cmdline":"/home/joseph/.local/bin/kiro-cli-chat chat --resume","cwd":"/home/joseph/Projects/Lexmata/lexmata-litify-integration","name":"kiro-cli-chat","pid":51033},{"argv":["/home/joseph/.local/share/kiro-cli/bun","/home/joseph/.local/share/kiro-cli/tui.js","chat","--resume"],"cmdline":"/home/joseph/.local/share/kiro-cli/bun /home/joseph/.local/share/kiro-cli/tui.js chat --resume","cwd":"/home/joseph/Projects/Lexmata/lexmata-litify-integration","name":"bun","pid":51122}],"pane_id":"w7G:p1","shell_pid":20518}"#,
+        )
+        .expect("fixture parses");
+        let argv = foreground_argv(&info);
+        assert_eq!(argv.len(), 3);
+        assert_eq!(argv[0], vec!["kiro-cli", "--resume"]);
+        // A live agent foreground must veto relaunch.
+        let pane = Pane { pane_id: "w7G:p1".into(), agent: Some("kiro".into()),
+            agent_status: Some("working".into()), ..Default::default() };
+        assert!(!should_relaunch(&pane, &argv, None));
+    }
+
+    /// Live idle-shell shape (`w78:p1`, 2026-09-15): single bare zsh in
+    /// `foreground_processes` → idle, relaunchable when agentless.
+    #[test]
+    fn foreground_argv_parses_live_idle_shell_shape() {
+        let info: serde_json::Value = serde_json::from_str(
+            r#"{"foreground_process_group_id":20508,"foreground_processes":[{"argv":["/usr/bin/zsh"],"cmdline":"/usr/bin/zsh","cwd":"/home/joseph/Projects/icedtea","name":"zsh","pid":20508}],"pane_id":"w78:p1","shell_pid":20508}"#,
+        )
+        .expect("fixture parses");
+        let argv = foreground_argv(&info);
+        assert_eq!(argv, vec![vec!["/usr/bin/zsh".to_string()]]);
+        let pane = Pane { pane_id: "w78:p1".into(), agent: None,
+            agent_status: Some("unknown".into()), ..Default::default() };
+        assert!(should_relaunch(&pane, &argv, None));
     }
 }

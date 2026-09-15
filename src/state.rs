@@ -73,6 +73,38 @@ pub fn clear_monitor_lock(pane_id: &str) {
     std::fs::remove_file(monitor_lock_path(pane_id)).ok();
 }
 
+/// All recorded `(pane_id, pid)` monitor locks (live or stale), read
+/// from the lock files' embedded JSON. Used by `status`/`stop`.
+pub fn monitor_locks() -> Vec<(String, u32)> {
+    let dir = monitors_dir();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return vec![],
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let text = match std::fs::read_to_string(entry.path()) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let v: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let pid = match v.get("pid").and_then(|p| p.as_u64()) {
+            Some(p) => p as u32,
+            None => continue,
+        };
+        let pane_id = match v.get("pane_id").and_then(|p| p.as_str()) {
+            Some(p) => p.to_string(),
+            None => continue,
+        };
+        out.push((pane_id, pid));
+    }
+    out.sort();
+    out
+}
+
 fn lock_record(pane_id: &str) -> Option<(u32, Option<String>)> {
     let text = std::fs::read_to_string(monitor_lock_path(pane_id)).ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
