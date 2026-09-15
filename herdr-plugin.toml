@@ -1,0 +1,49 @@
+id = "quinnjr.auto-resume"
+name = "Auto Resume"
+version = "0.1.0"
+min_herdr_version = "0.7.5"
+description = "Relaunch dead agent panes into their previous sessions (claude, opencode, kiro-cli, ...). Rust."
+platforms = ["linux", "macos"]
+
+[[startup]]
+command = ["auto-resume", "startup"]
+
+[[events]]
+on = "pane.created"
+command = ["auto-resume", "hook-pane"]
+
+[[events]]
+on = "pane.agent_detected"
+command = ["auto-resume", "hook-pane"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["auto-resume", "hook-pane"]
+
+[[events]]
+on = "pane.exited"
+command = ["auto-resume", "hook-pane"]
+
+[[actions]]
+id = "supervise-all"
+title = "Auto Resume: scan all panes and start monitors"
+contexts = ["global"]
+command = ["auto-resume", "supervise-all"]
+
+[[actions]]
+id = "status"
+title = "Auto Resume: status"
+contexts = ["global"]
+command = ["auto-resume", "status"]
+
+[[actions]]
+id = "stop"
+title = "Auto Resume: stop monitoring"
+contexts = ["global"]
+command = ["auto-resume", "stop"]
+
+[[actions]]
+id = "logs"
+title = "Auto Resume: logs"
+contexts = ["global"]
+command = ["auto-resume", "logs"]
