@@ -331,6 +331,82 @@ pub fn pane_run(id: &str, argv: &[&str]) -> bool {
     run_checked(&["pane", "run", id, &line], "pane_run").is_some()
 }
 
+/// Suffix a joined command line with an exit-code marker so a later
+/// `pane_read` can tell a clean exit (`:0`) from a crash. The marker
+/// always prints: `;` runs it for any exit reason short of the shell
+/// itself dying (which surfaces as pane misses instead).
+fn wrap_with_exit_marker(line: &str) -> String {
+    format!("{line}; printf '@@AUTORESUME-EXIT:%s@@\\n' \"$?\"")
+}
+
+/// Relaunch with the exit marker wrapped (see `wrap_with_exit_marker`).
+/// Same verbatim single-`COMMAND` delivery as `pane_run`.
+pub fn pane_run_wrapped(id: &str, argv: &[&str]) -> bool {
+    if argv.is_empty() {
+        eprintln!("herdr: pane_run_wrapped called with empty argv for {id}");
+        return false;
+    }
+    let line = wrap_with_exit_marker(&join_command(argv));
+    run_checked(&["pane", "run", id, &line], "pane_run_wrapped").is_some()
+}
+
+/// POSIX shells for exit-marker wrapping (`;` + `$?` + `printf`).
+/// `fish` (`$status`), `nu`, and `pwsh` need different syntax and stay
+/// on the legacy unwrapped path.
+const POSIX_SHELLS: &[&str] = &["zsh", "bash", "sh", "dash", "ksh", "ash"];
+
+/// True when the foreground is a single bare POSIX shell (basename
+/// match, path and login-`-` prefixes stripped) — the only shape we
+/// wrap with an exit marker. Called on the idle-shell foreground that
+/// `should_relaunch` already vetted, so arity is 1×1 in practice.
+pub(crate) fn foreground_shell_is_posix(proc_argv: &[Vec<String>]) -> bool {
+    if proc_argv.len() != 1 || proc_argv[0].len() != 1 {
+        return false;
+    }
+    let prog = &proc_argv[0][0];
+    let base = prog.rsplit('/').next().unwrap_or(prog);
+    let base = base.strip_prefix('-').unwrap_or(base);
+    POSIX_SHELLS.contains(&base)
+}
+
+/// Type literal text into a pane and submit it: the two-step half of a
+/// relaunch for agents whose template carries no `{message}` (e.g.
+/// opencode — verified live: typed input into a resumed TUI is answered,
+/// while `--prompt` neither submits nor visibly pre-fills). TEXT goes as
+/// one `send-text` value so embedded flags stay inert; `Enter` submits.
+pub fn send_text_enter(id: &str, text: &str) -> bool {
+    run_checked(&["pane", "send-text", id, text], "pane_send_text").is_some()
+        && run_checked(&["pane", "send-keys", id, "Enter"], "pane_send_keys").is_some()
+}
+
+/// Read a pane's recent scrollback as text (bounded tail for marker
+/// scans). Raw terminal output, not a result envelope: any exit-0
+/// stdout is taken verbatim. None on spawn/timeout/non-zero exit.
+pub fn pane_read(id: &str) -> Option<String> {
+    run_checked(&["pane", "read", id, "--lines", "50", "--format", "text"], "pane_read")
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+}
+
+const EXIT_MARKER_PREFIX: &str = "@@AUTORESUME-EXIT:";
+
+/// The last wrapped-run exit code in scrollback, if any. Malformed
+/// tails are skipped by scanning backwards; anything non-numeric or
+/// unterminated never matches.
+pub(crate) fn parse_exit_marker(text: &str) -> Option<i32> {
+    let mut search = text;
+    while let Some(idx) = search.rfind(EXIT_MARKER_PREFIX) {
+        let rest = &search[idx + EXIT_MARKER_PREFIX.len()..];
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !digits.is_empty() && rest[digits.len()..].starts_with("@@") {
+            if let Ok(code) = digits.parse::<i32>() {
+                return Some(code);
+            }
+        }
+        search = &search[..idx];
+    }
+    None
+}
+
 pub fn process_info(id: &str) -> Option<Value> {
     invoke(&["pane", "process-info", "--pane", id])?
         .get("process_info")
@@ -690,6 +766,114 @@ mod tests {
         run_with_fake_herdr("#!/bin/sh\nexit 0\n", &[], |_| {
             assert!(!pane_run("w1:p1", &[]));
         });
+    }
+
+    #[test]
+    fn pane_run_wrapped_appends_exit_marker() {
+        // Single COMMAND value: joined line + `;` + marker suffix.
+        run_with_fake_herdr(
+            "#!/bin/sh\necho \"$#:$@\" >> \"@CALL_LOG@\"\nexit 0\n",
+            &[],
+            |dir| {
+                assert!(pane_run_wrapped("w1:p1", &["kiro-cli", "chat", "-r"]));
+                assert_eq!(
+                    crate::test_support::herdr_calls(dir).lines().collect::<Vec<_>>(),
+                    vec!["4:pane run w1:p1 kiro-cli chat -r; printf '@@AUTORESUME-EXIT:%s@@\\n' \"$?\""]
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn pane_run_wrapped_false_on_empty_argv() {
+        run_with_fake_herdr("#!/bin/sh\nexit 0\n", &[], |_| {
+            assert!(!pane_run_wrapped("w1:p1", &[]));
+        });
+    }
+
+    #[test]
+    fn foreground_shell_is_posix_matches_bare_shells() {
+        let zsh = vec![vec!["/usr/bin/zsh".to_string()]];
+        assert!(foreground_shell_is_posix(&zsh));
+        let login = vec![vec!["-bash".to_string()]];
+        assert!(foreground_shell_is_posix(&login));
+        for shell in ["fish", "nu", "pwsh"] {
+            let argv = vec![vec![shell.to_string()]];
+            assert!(!foreground_shell_is_posix(&argv), "{shell} must stay unwrapped");
+        }
+        assert!(!foreground_shell_is_posix(&[]));
+        assert!(!foreground_shell_is_posix(&[vec!["/usr/bin/zsh".into(), "-c".into()]]));
+        assert!(!foreground_shell_is_posix(&[vec!["/usr/bin/zsh".into()], vec!["/usr/bin/zsh".into()]]));
+    }
+
+    #[test]
+    fn parse_exit_marker_takes_last_well_formed() {
+        assert_eq!(parse_exit_marker("@@AUTORESUME-EXIT:0@@"), Some(0));
+        assert_eq!(parse_exit_marker("@@AUTORESUME-EXIT:137@@"), Some(137));
+        assert_eq!(
+            parse_exit_marker("old @@AUTORESUME-EXIT:1@@ prompt @@AUTORESUME-EXIT:0@@ » "),
+            Some(0),
+            "last marker wins"
+        );
+        assert_eq!(parse_exit_marker("no marker here"), None);
+        assert_eq!(parse_exit_marker("@@AUTORESUME-EXIT:@@"), None);
+        assert_eq!(parse_exit_marker("@@AUTORESUME-EXIT:4x@@"), None);
+        assert_eq!(parse_exit_marker("@@AUTORESUME-EXIT:4"), None, "unterminated");
+        assert_eq!(
+            parse_exit_marker("@@AUTORESUME-EXIT:@@ tail @@AUTORESUME-EXIT:3@@"),
+            Some(3),
+            "malformed earlier marker skipped"
+        );
+    }
+
+    #[test]
+    fn pane_read_returns_scrollback_text() {
+        run_with_fake_herdr(
+            "#!/bin/sh\necho 'scrollback with @@AUTORESUME-EXIT:0@@'\nexit 0\n",
+            &[],
+            |_| {
+                assert_eq!(
+                    pane_read("w1:p1").as_deref(),
+                    Some("scrollback with @@AUTORESUME-EXIT:0@@\n")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn pane_read_none_on_failure() {
+        run_with_fake_herdr("#!/bin/sh\nexit 1\n", &[], |_| {
+            assert_eq!(pane_read("w1:p1"), None);
+        });
+    }
+
+    #[test]
+    fn send_text_enter_sends_text_then_enter() {
+        run_with_fake_herdr(
+            "#!/bin/sh\necho \"$#:$@\" >> \"@CALL_LOG@\"\nexit 0\n",
+            &[],
+            |dir| {
+                assert!(send_text_enter("w1:p1", "continue"));
+                assert_eq!(
+                    crate::test_support::herdr_calls(dir).lines().collect::<Vec<_>>(),
+                    vec![
+                        "4:pane send-text w1:p1 continue",
+                        "4:pane send-keys w1:p1 Enter",
+                    ]
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn send_text_enter_false_when_keys_fail() {
+        run_with_fake_herdr(
+            "#!/bin/sh\nif [ \"$2\" = \"send-keys\" ]; then exit 1; fi\nexit 0\n",
+            &[],
+            |_| {
+                assert!(!send_text_enter("w1:p1", "continue"));
+            },
+        );
     }
 
     #[test]
