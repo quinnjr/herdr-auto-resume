@@ -18,16 +18,30 @@ Each supervised agent pane gets a polling **monitor**
    subagent runs; two live primaries sharing one folder can still
    cross-pin (same ambiguity as `chat -r`, frozen at pin time instead
    of drifting).
-2. Relaunches via `herdr pane run -- <command>` **only** when every
+2. Relaunches via `herdr pane run <pane> <command>` **only** when every
    pane foreground process is a bare idle shell and the post-relaunch
    cooldown has expired. Recorded agent/status are ignored (after a
    crash they are stale); resolving the resume command still requires a
    known session (live `agent_session`, registry, or process-argv
    derivation, else a valueless `<agent>-fallback` template), otherwise
    the poll logs `NoResume` and launches nothing. Any live foreground
-   process vetoes — failing closed. The `--` separator keeps agent
-   flags that herdr itself defines (notably `--session`) from being
-   consumed as herdr's own options.
+   process vetoes — failing closed. The command goes as a single
+   `COMMAND` value (embedded agent flags stay inert inside it — no
+   `--` separator, which herdr types literally into the pane; see
+   `pane_run` in `src/herdr.rs` for the verified herdr 0.8.2 rationale).
+   Resurrection is one-shot: a successful relaunch spends the saved
+   session, so an intentionally-exited agent stays dead after one
+   comeback — while a live agent re-saves every poll and re-arms the
+   next crash recovery. Failed delivery keeps the entry and retries.
+   Valueless fallback relaunches (e.g. `kiro-cli chat -r`) carry no
+   session to spend, so they are gated one-shot per monitor instead: a
+   later live Refresh (valued session known again) re-arms them. Any
+   successful relaunch, valued or fallback, spends the fallback
+   one-shot — otherwise a valued comeback plus another death would
+   resurrect twice.
+   Re-arming needs an observable live session (`agent_session`,
+   registry, or argv); an agent that never exposes one is not
+   re-armed and stays dead after its single fallback comeback.
 
 Monitors exit on a `stop-<pid>` sentinel (`stop` action). They are
 spawned detached but **without `setsid`/double-fork**, so they die with

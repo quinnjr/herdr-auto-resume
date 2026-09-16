@@ -97,6 +97,15 @@ pub fn save_registry(reg: &HashMap<String, SessionRef>) {
     std::fs::rename(&tmp, registry_path()).ok();
 }
 
+/// Forget the session for a pane: one-shot resurrection consumed the
+/// entry (a later live agent re-arms via `remember`). No-op — and no
+/// file write — when the pane has no entry.
+pub fn forget(pane_id: &str) {
+    let mut reg = load_registry();
+    if reg.remove(pane_id).is_some() {
+        save_registry(&reg);
+    }
+}
 /// Record (or overwrite) the session for a pane, persisting to disk.
 /// Skips the write when the stored value is unchanged (monitors call this
 /// every poll while the agent is alive). Refuses unsafe session values.
@@ -565,6 +574,44 @@ mod tests {
         }
         assert!(result.is_ok());
         dir
+    }
+
+    #[test]
+    fn forget_removes_entry_and_rewrites() {
+        let dir = with_temp_state_dir(|dir| {
+            remember(
+                "w7G:p1",
+                SessionRef {
+                    agent: "kiro".into(),
+                    value: "sess-1".into(),
+                },
+            );
+            remember(
+                "w7G:p2",
+                SessionRef {
+                    agent: "claude".into(),
+                    value: "sess-2".into(),
+                },
+            );
+            forget("w7G:p1");
+            let reg = load_registry();
+            assert!(!reg.contains_key("w7G:p1"));
+            assert_eq!(reg["w7G:p2"].value, "sess-2");
+            assert!(dir.join("registry.json").exists());
+        });
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn forget_noop_without_write() {
+        let dir = with_temp_state_dir(|dir| {
+            forget("w7G:p9");
+            assert!(
+                !dir.join("registry.json").exists(),
+                "forget of absent entry must not create a registry"
+            );
+        });
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -278,14 +278,57 @@ pub fn pane_get(id: &str) -> Option<Pane> {
     }
 }
 
+/// Bytes (beyond ASCII alphanumerics) that pass through unquoted in a
+/// joined command line: none is a shell metacharacter in trailing-arg
+/// position, so bare tokens are inert under POSIX `sh` quoting rules.
+const BARE_TOKEN_BYTES: &[u8] = b"-_./:,=+@%";
+
+/// True when `tok` needs no quoting in a joined shell line. Leading
+/// `=` is excluded: zsh performs `=cmd` expansion on word-initial `=`
+/// even in trailing-arg position.
+fn is_bare_token(tok: &str) -> bool {
+    !tok.is_empty()
+        && !tok.starts_with('=')
+        && tok
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || BARE_TOKEN_BYTES.contains(&b))
+}
+
+/// Join argv into a single shell line for delivery as one `pane run`
+/// `COMMAND` value: bare tokens pass through, anything else is
+/// single-quoted (embedded `'` → `'\''`, per POSIX §2.2.2; POSIX shells
+/// only). Typical valued resume templates never quote — session values
+/// are pre-screened by `is_safe_session_value` and session-ID shapes
+/// stay in the bare set (`^`/non-ASCII values still quote, correctly).
+fn join_command(argv: &[&str]) -> String {
+    argv.iter()
+        .map(|tok| {
+            if is_bare_token(tok) {
+                (*tok).to_string()
+            } else {
+                format!("'{}'", tok.replace('\'', "'\\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 pub fn pane_run(id: &str, argv: &[&str]) -> bool {
-    // `--` separates the pane id from the command: resume argv may carry
-    // flags herdr itself defines (notably `--session` for opencode/pi),
-    // which herdr would otherwise consume as its own global option and
-    // fail with `server_not_running` for a bogus session name.
-    let mut args = vec!["pane", "run", id, "--"];
-    args.extend_from_slice(argv);
-    run_checked(&args, "pane_run").is_some()
+    // The joined line goes as ONE `COMMAND` value (never re-split), so
+    // herdr cannot mistake embedded agent flags for its own options —
+    // a single value starting with the program name is never parsed as
+    // a flag. No `--` separator: herdr types it literally into the pane
+    // (`zsh: command not found: --`, observed live on herdr 0.8.2), and
+    // without it multi-token argv lets herdr consume its own globals
+    // (notably `--session` → `server_not_running`).
+    // TODO(herdr>0.8.2): re-probe `pane run <id> -- <cmd>`; if herdr
+    // strips the separator again, the join can go back to plain argv.
+    if argv.is_empty() {
+        eprintln!("herdr: pane_run called with empty argv for {id}");
+        return false;
+    }
+    let line = join_command(argv);
+    run_checked(&["pane", "run", id, &line], "pane_run").is_some()
 }
 
 pub fn process_info(id: &str) -> Option<Value> {
@@ -299,41 +342,14 @@ mod tests {
     use super::*;
 
     use crate::test_support::lock_env;
-
-    /// Run `f` with `HERDR_BIN_PATH` pointed at an executable shell script
-    /// with `script_body`, restoring the previous value afterwards.
-    fn with_fake_herdr(script_body: &str, f: impl FnOnce()) {
-        let _guard = lock_env();
-        let prev = std::env::var_os("HERDR_BIN_PATH");
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!(
-            "auto-resume-herdr-test-{}-{nanos}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        let path = dir.join("herdr");
-        std::fs::write(&path, script_body).expect("write fake herdr");
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod fake herdr");
-        std::env::set_var("HERDR_BIN_PATH", &path);
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-        match prev {
-            Some(v) => std::env::set_var("HERDR_BIN_PATH", v),
-            None => std::env::remove_var("HERDR_BIN_PATH"),
-        }
-        std::fs::remove_dir_all(&dir).ok();
-        assert!(result.is_ok());
-    }
+    use crate::test_support::{herdr_calls, run_with_fake_herdr};
 
     #[test]
     fn invoke_returns_none_on_nonzero_exit() {
-        with_fake_herdr(
+        run_with_fake_herdr(
             "#!/bin/sh\necho '{\"id\":\"cli:pane:list\",\"result\":{\"panes\":[]}}'\nexit 1\n",
-            || {
+            &[],
+            |_| {
                 assert_eq!(invoke(&["pane", "list"]), None);
             },
         );
@@ -341,9 +357,10 @@ mod tests {
 
     #[test]
     fn invoke_skips_envelope_carrying_error() {
-        with_fake_herdr(
+        run_with_fake_herdr(
             "#!/bin/sh\necho '{\"id\":\"cli:pane:list\",\"error\":\"boom\",\"result\":{\"panes\":[]}}'\n",
-            || {
+            &[],
+            |_| {
                 assert_eq!(invoke(&["pane", "list"]), None);
             },
         );
@@ -351,9 +368,10 @@ mod tests {
 
     #[test]
     fn invoke_treats_null_result_as_absent() {
-        with_fake_herdr(
+        run_with_fake_herdr(
             "#!/bin/sh\necho '{\"id\":\"cli:pane:list\",\"result\":null}'\n",
-            || {
+            &[],
+            |_| {
                 assert_eq!(invoke(&["pane", "list"]), None);
             },
         );
@@ -361,9 +379,10 @@ mod tests {
 
     #[test]
     fn invoke_returns_last_result_envelope() {
-        with_fake_herdr(
+        run_with_fake_herdr(
             "#!/bin/sh\necho 'starting up'\necho '{\"id\":\"cli:pane:list\",\"result\":{\"panes\":[{\"pane_id\":\"w1:p1\"}]}}'\n",
-            || {
+            &[],
+            |_| {
                 let v = invoke(&["pane", "list"]).expect("valid envelope parses");
                 assert_eq!(
                     v.get("panes").and_then(|p| p.as_array()).map(|a| a.len()),
@@ -399,9 +418,10 @@ mod tests {
 
     #[test]
     fn invoke_parses_envelope_with_nested_error_value() {
-        with_fake_herdr(
+        run_with_fake_herdr(
             "#!/bin/sh\necho '{\"id\":\"cli:pane:list\",\"result\":{\"panes\":[{\"pane_id\":\"w1:p1\",\"detail\":{\"error\":\"nested boom\"}}]}}'\n",
-            || {
+            &[],
+            |_| {
                 let v = invoke(&["pane", "list"]).expect("nested error value must still parse");
                 assert_eq!(
                     v.get("panes").and_then(|p| p.as_array()).map(|a| a.len()),
@@ -413,9 +433,10 @@ mod tests {
 
     #[test]
     fn pane_run_true_on_exit_zero_with_null_result() {
-        with_fake_herdr(
+        run_with_fake_herdr(
             "#!/bin/sh\necho '{\"id\":\"cli:pane:run\",\"result\":null}'\nexit 0\n",
-            || {
+            &[],
+            |_| {
                 assert!(pane_run("w1:p1", &["echo", "hi"]));
             },
         );
@@ -423,9 +444,10 @@ mod tests {
 
     #[test]
     fn pane_run_false_on_nonzero_exit() {
-        with_fake_herdr(
+        run_with_fake_herdr(
             "#!/bin/sh\necho '{\"id\":\"cli:pane:run\",\"result\":{\"ok\":true}}'\nexit 1\n",
-            || {
+            &[],
+            |_| {
                 assert!(!pane_run("w1:p1", &["echo", "hi"]));
             },
         );
@@ -433,9 +455,10 @@ mod tests {
 
     #[test]
     fn pane_list_returns_panes_from_envelope() {
-        with_fake_herdr(
+        run_with_fake_herdr(
             "#!/bin/sh\necho '{\"id\":\"cli:pane:list\",\"result\":{\"panes\":[{\"pane_id\":\"w7G:p1\",\"agent\":\"kiro\",\"agent_status\":\"working\",\"cwd\":\"/tmp\",\"workspace_id\":\"w7G\"}]}}'\n",
-            || {
+            &[],
+            |_| {
                 let panes = pane_list();
                 assert_eq!(panes.len(), 1);
                 assert_eq!(panes[0].pane_id, "w7G:p1");
@@ -449,9 +472,10 @@ mod tests {
 
     #[test]
     fn pane_get_returns_pane_object() {
-        with_fake_herdr(
+        run_with_fake_herdr(
             "#!/bin/sh\necho '{\"id\":\"cli:pane:get\",\"result\":{\"pane\":{\"pane_id\":\"w7G:p1\",\"agent\":\"kiro\",\"agent_status\":\"working\",\"cwd\":\"/tmp\",\"workspace_id\":\"w7G\"}}}'\n",
-            || {
+            &[],
+            |_| {
                 let pane = pane_get("w7G:p1").expect("pane_get parses pane object");
                 assert_eq!(pane.pane_id, "w7G:p1");
                 assert_eq!(pane.agent.as_deref(), Some("kiro"));
@@ -464,9 +488,10 @@ mod tests {
 
     #[test]
     fn process_info_returns_process_info_object() {
-        with_fake_herdr(
+        run_with_fake_herdr(
             "#!/bin/sh\necho '{\"id\":\"cli:pane:process-info\",\"result\":{\"process_info\":{\"pid\":123,\"command\":\"claude\"}}}'\n",
-            || {
+            &[],
+            |_| {
                 let info = process_info("w7G:p1").expect("process_info parses object");
                 assert_eq!(info.get("pid").and_then(|v| v.as_u64()), Some(123));
                 assert_eq!(
@@ -529,7 +554,7 @@ mod tests {
     #[test]
     fn invoke_times_out_and_returns_none() {
         let start = std::time::Instant::now();
-        with_fake_herdr("#!/bin/sh\nsleep 30\n", || {
+        run_with_fake_herdr("#!/bin/sh\nsleep 30\n", &[], |_| {
             assert_eq!(invoke(&["pane", "list"]), None);
         });
         let elapsed = start.elapsed();
@@ -548,9 +573,10 @@ mod tests {
         // Child exits 0 immediately but leaves a backgrounded grandchild
         // holding the pipe write ends: success-path join must not hang.
         let start = std::time::Instant::now();
-        with_fake_herdr(
+        run_with_fake_herdr(
             "#!/bin/sh\nsleep 30 &\necho '{\"id\":\"x\",\"result\":{\"panes\":[]}}'\n",
-            || {
+            &[],
+            |_| {
                 let panes = pane_list();
                 assert!(panes.is_empty());
             },
@@ -577,9 +603,10 @@ mod tests {
 
     #[test]
     fn pane_get_falls_back_to_bare_pane_on_schema_drift() {
-        with_fake_herdr(
+        run_with_fake_herdr(
             "#!/bin/sh\necho '{\"id\":\"cli:pane:get\",\"result\":{\"pane\":{\"pane_id\":\"w1:p9\",\"agent\":5}}}'\n",
-            || {
+            &[],
+            |_| {
                 let pane = pane_get("w1:p9").expect("schema drift degrades to bare pane");
                 assert_eq!(pane.pane_id, "w1:p9");
             },
@@ -587,18 +614,82 @@ mod tests {
     }
 
     #[test]
-    fn pane_run_inserts_separator_before_command() {
-        // Regression: resume argv containing herdr's own global flags
-        // (e.g. opencode/pi `--session`) was consumed by herdr itself
-        // (`server_not_running` for a session named like the agent
-        // session id). `pane run` must separate the pane id from the
-        // command with `--` so agent flags reach the pane verbatim.
-        with_fake_herdr(
-            "#!/bin/sh\nif [ \"$4\" = \"--\" ]; then exit 0; else echo \"missing --: $@\"; exit 1; fi\n",
-            || {
+    fn pane_run_sends_single_command_value() {
+        // Delivery contract (see `pane_run` docs): the joined line goes
+        // as ONE `COMMAND` value.
+        run_with_fake_herdr(
+            "#!/bin/sh\necho \"$#:$@\" >> \"@CALL_LOG@\"\nexit 0\n",
+            &[],
+            |dir| {
                 assert!(pane_run("w1:p1", &["opencode", "--session", "ses-1"]));
+                let lines: Vec<String> = herdr_calls(dir)
+                    .lines()
+                    .map(str::to_string)
+                    .collect();
+                assert_eq!(
+                    lines,
+                    vec!["4:pane run w1:p1 opencode --session ses-1"],
+                    "one pane run call, command as a single value"
+                );
             },
         );
+    }
+
+    #[test]
+    fn pane_run_quotes_text_as_single_token() {
+        // End-to-end wiring into `join_command` (arity stays 4).
+        run_with_fake_herdr(
+            "#!/bin/sh\necho \"$#:$@\" >> \"@CALL_LOG@\"\nexit 0\n",
+            &[],
+            |dir| {
+                assert!(pane_run("w1:p1", &["echo", "a b"]));
+                assert_eq!(
+                    herdr_calls(dir).lines().collect::<Vec<_>>(),
+                    vec!["4:pane run w1:p1 echo 'a b'"]
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn join_command_quotes_only_when_needed() {
+        assert_eq!(join_command(&["opencode", "--session", "ses-1"]), "opencode --session ses-1");
+        assert_eq!(
+            join_command(&["kiro-cli", "chat", "--resume-id", "7d204a41-9bac-4530-a190-c4bbe12461f5"]),
+            "kiro-cli chat --resume-id 7d204a41-9bac-4530-a190-c4bbe12461f5"
+        );
+        assert_eq!(join_command(&["echo", "a b"]), "echo 'a b'");
+        assert_eq!(join_command(&["echo", "a'b"]), "echo 'a'\\''b'");
+        assert_eq!(join_command(&[] as &[&str]), "");
+    }
+
+    #[test]
+    fn join_command_quotes_shell_metachars_and_empty() {
+        // Every shell-active byte must take the quoted branch; bare-set
+        // members must stay unquoted (over-quoting regressions fail).
+        assert_eq!(join_command(&["echo", ""]), "echo ''");
+        assert_eq!(join_command(&["echo", "a$b"]), "echo 'a$b'");
+        assert_eq!(join_command(&["echo", "a`b`"]), "echo 'a`b`'");
+        assert_eq!(join_command(&["echo", "a\"b"]), "echo 'a\"b'");
+        assert_eq!(join_command(&["echo", "a\\b"]), "echo 'a\\b'");
+        assert_eq!(join_command(&["echo", "a;b"]), "echo 'a;b'");
+        assert_eq!(join_command(&["echo", "a|b"]), "echo 'a|b'");
+        assert_eq!(join_command(&["echo", "a&b"]), "echo 'a&b'");
+        assert_eq!(join_command(&["echo", "caf\u{e9}"]), "echo 'caf\u{e9}'");
+        assert_eq!(join_command(&["echo", "=foo"]), "echo '=foo'");
+        assert_eq!(
+            join_command(&["echo", "a*b?c#d~e!f(g)h[i]j{k}l<m>n"]),
+            "echo 'a*b?c#d~e!f(g)h[i]j{k}l<m>n'"
+        );
+        assert_eq!(join_command(&["echo", "a\nb\tc"]), "echo 'a\nb\tc'");
+        assert_eq!(join_command(&["prog", "a-b_c.d=e+f@g%h/i:j,k"]), "prog a-b_c.d=e+f@g%h/i:j,k");
+    }
+
+    #[test]
+    fn pane_run_false_on_empty_argv() {
+        run_with_fake_herdr("#!/bin/sh\nexit 0\n", &[], |_| {
+            assert!(!pane_run("w1:p1", &[]));
+        });
     }
 
     #[test]
@@ -616,9 +707,10 @@ mod tests {
 
     #[test]
     fn pane_list_checked_some_empty_on_success_empty() {
-        with_fake_herdr(
+        run_with_fake_herdr(
             "#!/bin/sh\necho '{\"id\":\"cli:pane:list\",\"result\":{\"panes\":[]}}'\n",
-            || {
+            &[],
+            |_| {
                 let v = pane_list_checked().expect("success with empty panes is Some");
                 assert!(v.is_empty());
             },
@@ -640,9 +732,10 @@ mod tests {
 
     #[test]
     fn pane_list_checked_none_on_nonzero_exit() {
-        with_fake_herdr(
+        run_with_fake_herdr(
             "#!/bin/sh\necho '{\"id\":\"cli:pane:list\",\"result\":{\"panes\":[]}}'\nexit 1\n",
-            || {
+            &[],
+            |_| {
                 assert_eq!(pane_list_checked(), None);
             },
         );
@@ -650,7 +743,7 @@ mod tests {
 
     #[test]
     fn pane_list_checked_none_on_success_without_envelope() {
-        with_fake_herdr("#!/bin/sh\necho 'garbage no json here'\nexit 0\n", || {
+        run_with_fake_herdr("#!/bin/sh\necho 'garbage no json here'\nexit 0\n", &[], |_| {
             assert_eq!(pane_list_checked(), None);
         });
     }

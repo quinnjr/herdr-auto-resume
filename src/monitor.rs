@@ -251,10 +251,50 @@ fn maybe_pin_kiro_session(pane: &Pane) {
     );
 }
 
+/// Per-monitor mutable poll state: the post-relaunch cooldown, the
+/// last-logged `NoResume` signature (repeat identical no-resume polls
+/// stay quiet), the warn-once marker for repetitive failure logs, and
+/// whether a valueless fallback relaunch was already spent.
+#[derive(Debug, Default)]
+struct MonitorState {
+    cooldown_until: Option<Instant>,
+    last_noresume: Option<(Option<String>, bool)>,
+    last_warn: Option<WarnKind>,
+    fallback_used: bool,
+}
+
+/// Repetitive failure logs, warned once until a successful action
+/// clears them (same spam philosophy as the `NoResume` throttle).
+/// Single slot by design: interleaved kinds re-log, which is accepted
+/// (alternating failures are themselves new information).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WarnKind {
+    RunFailed,
+    ProcInfoFailed,
+    FallbackSpent,
+}
+
+impl MonitorState {
+    /// Log `line` unless it is the same warning as last time.
+    fn warn_once(&mut self, kind: WarnKind, line: String) {
+        if self.last_warn != Some(kind) {
+            self.last_warn = Some(kind);
+            crate::state::append_log(&line);
+        }
+    }
+
+    /// A successful Refresh or relaunch clears all warn state: the world
+    /// changed, so the next failure is new information again.
+    fn clear_warns(&mut self) {
+        self.last_warn = None;
+        self.last_noresume = None;
+    }
+}
+
 /// One monitor poll. Returns false when the pane no longer exists
 /// (`pane_get` → None) so the caller can count consecutive misses.
 /// Thin I/O shell around the pure `decide_poll`.
-fn poll_once(pane_id: &str, config: &Config, cooldown_until: &mut Option<Instant>) -> bool {
+fn poll_once(pane_id: &str, config: &Config, st: &mut MonitorState) -> bool {
     let Some(pane) = herdr::pane_get(pane_id) else {
         return false;
     };
@@ -268,6 +308,8 @@ fn poll_once(pane_id: &str, config: &Config, cooldown_until: &mut Option<Instant
             {
                 // Fail-closed AND diagnosable: record the shape we saw
                 // so future `process-info` drift shows up in the log.
+                // Warn-once: a persistently broken shape must not spam
+                // every poll (same philosophy as the NoResume throttle).
                 let keys = v
                     .as_object()
                     .map(|o| {
@@ -277,44 +319,97 @@ fn poll_once(pane_id: &str, config: &Config, cooldown_until: &mut Option<Instant
                             .join(",")
                     })
                     .unwrap_or_else(|| "<non-object>".to_string());
-                crate::state::append_log(&format!(
-                    "monitor {pane_id}: empty/unparseable foreground parse; keys={keys}"
-                ));
+                st.warn_once(
+                    WarnKind::ProcInfoFailed,
+                    format!(
+                        "monitor {pane_id}: empty/unparseable foreground parse; keys={keys}"
+                    ),
+                );
             }
             argv
         }
         None => {
-            crate::state::append_log(&format!(
-                "monitor {pane_id}: process-info failed; vetoing relaunch"
-            ));
+            st.warn_once(
+                WarnKind::ProcInfoFailed,
+                format!("monitor {pane_id}: process-info failed; vetoing relaunch"),
+            );
             vec![]
         }
     };
     // Kiro session pinning (best-effort discovery; registry reloaded after).
     maybe_pin_kiro_session(&pane);
     let reg = crate::state::load_registry();
-    match decide_poll(&pane, &proc_argv, &reg, config, cooldown_until) {
+    match decide_poll(&pane, &proc_argv, &reg, config, &st.cooldown_until) {
         PollAction::Refresh(sess) => {
+            // A live agent re-arms everything: registry (valued path for
+            // the next crash) and the fallback + warn state below. The
+            // fallback flag re-arms only on a valued session: a valueless
+            // Refresh is refused by `remember` and must not re-arm either.
+            if !sess.value.is_empty() {
+                st.fallback_used = false;
+            }
+            st.clear_warns();
             crate::state::remember(pane_id, sess);
         }
         PollAction::Relaunch { agent, argv } => {
+            // Valueless fallback relaunches (e.g. kiro `chat -r`) carry
+            // no session to spend, so the registry consume below cannot
+            // stop them: gate them one-shot in memory instead. A later
+            // Refresh (valued session known again) re-arms.
+            let valued = crate::resume::resolve_session_with_commands(
+                &pane,
+                reg.get(&pane.pane_id),
+                &proc_argv,
+                &config.commands,
+            )
+            .is_some_and(|s| !s.value.is_empty());
+            if !valued && st.fallback_used {
+                st.warn_once(
+                    WarnKind::FallbackSpent,
+                    format!(
+                        "monitor {pane_id}: fallback relaunch already spent for '{agent}'; staying dead until a valued session is known"
+                    ),
+                );
+                return true;
+            }
             let args: Vec<&str> = argv.iter().map(String::as_str).collect();
             if herdr::pane_run(pane_id, &args) {
-                *cooldown_until =
+                st.cooldown_until =
                     Some(Instant::now() + Duration::from_secs(config.cooldown_seconds));
+                // One-shot resurrection: the relaunch spends the saved
+                // session. A live agent re-arms via Refresh; an
+                // intentionally-exited one stays dead after this comeback.
+                // Spending only on success keeps retrying failed delivery.
+                // (Fallback relaunches spend the in-memory flag instead:
+                // there is no registry entry to consume.)
+                crate::state::forget(pane_id);
+                // Any successful relaunch — valued or fallback — spends
+                // the fallback one-shot too: otherwise a valued comeback
+                // followed by another death would fallback-resurrect on
+                // top, violating one-shot. Only a later live Refresh
+                // re-arms.
+                st.fallback_used = true;
+                st.clear_warns();
                 crate::state::append_log(&format!("monitor {pane_id}: relaunched {agent}"));
             } else {
-                crate::state::append_log(&format!(
-                    "monitor {pane_id}: pane run failed for {agent}"
-                ));
+                st.warn_once(
+                    WarnKind::RunFailed,
+                    format!("monitor {pane_id}: pane run failed for {agent}"),
+                );
             }
         }
         PollAction::NoResume { agent, value_known } => {
-            let agent_name = agent.unwrap_or_default();
-            crate::state::append_log(&format!(
-                "monitor {pane_id}: no resume argv for '{agent_name}' (value known: {value_known})"
-            ));
+            let key = (agent.clone(), value_known);
+            if st.last_noresume.as_ref() != Some(&key) {
+                st.last_noresume = Some(key);
+                let agent_name = agent.unwrap_or_default();
+                crate::state::append_log(&format!(
+                    "monitor {pane_id}: no resume argv for '{agent_name}' (value known: {value_known})"
+                ));
+            }
         }
+        // Deliberately retains the throttle: transient liveness between
+        // identical NoResume polls is a blip, not new information.
         PollAction::Nothing => {}
     }
     true
@@ -356,7 +451,7 @@ pub fn run(pane_id: &str) {
         }
         std::thread::sleep(Duration::from_secs(1));
     }
-    let mut cooldown_until: Option<Instant> = None;
+    let mut st = MonitorState::default();
     // A pane that stays gone (closed/deleted) must not spin a monitor
     // forever: exit and clear the lock after 10 consecutive misses.
     let mut missing = 0u32;
@@ -365,7 +460,7 @@ pub fn run(pane_id: &str) {
             finish_monitor(pane_id, own_pid);
             break;
         }
-        if poll_once(pane_id, &config, &mut cooldown_until) {
+        if poll_once(pane_id, &config, &mut st) {
             missing = 0;
         } else {
             missing += 1;
@@ -646,33 +741,28 @@ mod tests {
         );
     }
 
-    use crate::test_support::run_with_fake_herdr;
-
-    /// Hermetic harness: fake `HERDR_BIN_PATH` + temp state dir (both
-    /// `HERDR_PLUGIN_STATE_DIR` and `HERDR_PLUGIN_CONFIG_DIR` point at it).
-    /// Thin wrapper over `crate::test_support::run_with_fake_herdr` (kept
-    /// so existing tests are untouched).
-    fn with_poll_harness(script_body: &str, f: impl FnOnce(&std::path::PathBuf)) {
-        run_with_fake_herdr(script_body, &[], |dir| f(&dir.to_path_buf()));
-    }
+    use crate::test_support::{herdr_calls, run_with_fake_herdr};
 
     #[test]
     fn poll_once_refresh_remembers_session() {
         let script = "#!/bin/sh\nif [ \"$1\" = \"pane\" ] && [ \"$2\" = \"get\" ]; then\necho '{\"id\":\"cli:pane:get\",\"result\":{\"pane\":{\"pane_id\":\"w1:p1\",\"agent\":\"claude\",\"agent_status\":\"working\",\"agent_session\":{\"agent\":\"claude\",\"value\":\"live-1\"}}}}'\nexit 0\nfi\nif [ \"$1\" = \"pane\" ] && [ \"$2\" = \"process-info\" ]; then\necho '{\"id\":\"cli:pane:process-info\",\"result\":{\"process_info\":{\"foreground_processes\":[{\"argv\":[\"claude\",\"--resume\",\"live-1\"]}]}}}'\nexit 0\nfi\nexit 1\n";
-        with_poll_harness(script, |_| {
+        run_with_fake_herdr(script, &[], |_| {
             let config = Config::default();
-            let mut cooldown: Option<Instant> = None;
-            assert!(poll_once("w1:p1", &config, &mut cooldown));
-            assert_eq!(cooldown, None);
+            let mut st = MonitorState::default();
+            assert!(poll_once("w1:p1", &config, &mut st));
+            assert_eq!(st.cooldown_until, None);
             let reg = crate::state::load_registry();
             assert_eq!(reg.get("w1:p1").expect("session remembered").value, "live-1");
         });
     }
 
     #[test]
-    fn poll_once_relaunch_sets_cooldown() {
-        let script = "#!/bin/sh\nif [ \"$1\" = \"pane\" ] && [ \"$2\" = \"get\" ]; then\necho '{\"id\":\"cli:pane:get\",\"result\":{\"pane\":{\"pane_id\":\"w1:p1\",\"agent_status\":\"unknown\"}}}'\nexit 0\nfi\nif [ \"$1\" = \"pane\" ] && [ \"$2\" = \"process-info\" ]; then\necho '{\"id\":\"cli:pane:process-info\",\"result\":{\"process_info\":{\"foreground_processes\":[{\"argv\":[\"/usr/bin/zsh\"]}]}}}'\nexit 0\nfi\nif [ \"$1\" = \"pane\" ] && [ \"$2\" = \"run\" ]; then\necho '{\"id\":\"cli:pane:run\",\"result\":{\"ok\":true}}'\nexit 0\nfi\nexit 1\n";
-        with_poll_harness(script, |state_dir| {
+    fn poll_once_relaunch_consumes_registry_entry() {
+        // One-shot resurrection: a successful relaunch spends the saved
+        // session, so an intentionally-exited agent stays dead after one
+        // comeback (a live agent re-arms via Refresh).
+        let script = "#!/bin/sh\nif [ \"$1\" = \"pane\" ] && [ \"$2\" = \"get\" ]; then\necho '{\"id\":\"cli:pane:get\",\"result\":{\"pane\":{\"pane_id\":\"w1:p1\",\"agent\":\"claude\",\"agent_status\":\"unknown\"}}}'\nexit 0\nfi\nif [ \"$1\" = \"pane\" ] && [ \"$2\" = \"process-info\" ]; then\necho '{\"id\":\"cli:pane:process-info\",\"result\":{\"process_info\":{\"foreground_processes\":[{\"argv\":[\"/usr/bin/zsh\"]}]}}}'\nexit 0\nfi\nif [ \"$1\" = \"pane\" ] && [ \"$2\" = \"run\" ]; then\necho '{\"id\":\"cli:pane:run\",\"result\":{\"ok\":true}}'\nexit 0\nfi\nexit 1\n";
+        run_with_fake_herdr(script, &[], |_| {
             crate::state::remember(
                 "w1:p1",
                 SessionRef {
@@ -681,19 +771,187 @@ mod tests {
                 },
             );
             let config = Config::default();
-            let mut cooldown: Option<Instant> = None;
-            assert!(poll_once("w1:p1", &config, &mut cooldown));
-            assert!(cooldown.is_some(), "successful relaunch sets cooldown");
+            let mut st = MonitorState::default();
+            assert!(poll_once("w1:p1", &config, &mut st));
+            assert!(st.cooldown_until.is_some());
+            assert!(
+                !crate::state::load_registry().contains_key("w1:p1"),
+                "successful relaunch must spend the registry entry"
+            );
+        });
+    }
+
+    #[test]
+    fn poll_once_failed_relaunch_keeps_registry() {
+        // Delivery failure must NOT spend the entry: the next cooldown
+        // expiry retries with the session still known.
+        let script = "#!/bin/sh\nif [ \"$1\" = \"pane\" ] && [ \"$2\" = \"get\" ]; then\necho '{\"id\":\"cli:pane:get\",\"result\":{\"pane\":{\"pane_id\":\"w1:p1\",\"agent\":\"claude\",\"agent_status\":\"unknown\"}}}'\nexit 0\nfi\nif [ \"$1\" = \"pane\" ] && [ \"$2\" = \"process-info\" ]; then\necho '{\"id\":\"cli:pane:process-info\",\"result\":{\"process_info\":{\"foreground_processes\":[{\"argv\":[\"/usr/bin/zsh\"]}]}}}'\nexit 0\nfi\nif [ \"$1\" = \"pane\" ] && [ \"$2\" = \"run\" ]; then\nexit 1\nfi\nexit 1\n";
+        run_with_fake_herdr(script, &[], |state_dir| {
+            crate::state::remember(
+                "w1:p1",
+                SessionRef {
+                    agent: "claude".into(),
+                    value: "abc-123".into(),
+                },
+            );
+            let config = Config::default();
+            let mut st = MonitorState::default();
+            assert!(poll_once("w1:p1", &config, &mut st));
+            assert_eq!(st.cooldown_until, None);
+            assert_eq!(
+                crate::state::load_registry().get("w1:p1").map(|s| s.value.as_str()),
+                Some("abc-123"),
+                "failed delivery must keep the registry entry"
+            );
+            assert!(poll_once("w1:p1", &config, &mut st)); // retry fails too
+            let log = std::fs::read_to_string(state_dir.join("log.txt")).unwrap_or_default();
+            assert_eq!(
+                log.lines().filter(|l| l.contains("pane run failed")).count(),
+                1,
+                "repeat delivery failures must log once, got: {log}"
+            );
+        });
+    }
+
+    #[test]
+    fn poll_once_noresume_logs_once_until_state_changes() {
+        // A spent/unknown session logs NoResume once; identical polls stay
+        // quiet, while an intervening Refresh re-arms the log (new info).
+        // Separate get/info phase flags so poll 1 is a true Refresh
+        // (live agent + live argv) and polls 2+ are dead-idle NoResume.
+        // The live agent is `zed` (mismatched with the later `claude`
+        // pane) so its remembered session never resolves: polls 2+
+        // stay NoResume instead of becoming valued relaunches.
+        let script = "#!/bin/sh\nD=\"$(dirname \"@CALL_LOG@\")\"\nif [ \"$1\" = \"pane\" ] && [ \"$2\" = \"get\" ]; then\nif [ -f \"$D/get2\" ]; then\necho '{\"id\":\"cli:pane:get\",\"result\":{\"pane\":{\"pane_id\":\"w1:p1\",\"agent\":\"claude\",\"agent_status\":\"unknown\"}}}'\nelse\ntouch \"$D/get2\"\necho '{\"id\":\"cli:pane:get\",\"result\":{\"pane\":{\"pane_id\":\"w1:p1\",\"agent\":\"zed\",\"agent_status\":\"working\",\"agent_session\":{\"agent\":\"zed\",\"value\":\"s1\"}}}}'\nfi\nexit 0\nfi\nif [ \"$1\" = \"pane\" ] && [ \"$2\" = \"process-info\" ]; then\nif [ -f \"$D/info2\" ]; then\necho '{\"id\":\"cli:pane:process-info\",\"result\":{\"process_info\":{\"foreground_processes\":[{\"argv\":[\"/usr/bin/zsh\"]}]}}}'\nelse\ntouch \"$D/info2\"\necho '{\"id\":\"cli:pane:process-info\",\"result\":{\"process_info\":{\"foreground_processes\":[{\"argv\":[\"zed\"]}]}}}'\nfi\nexit 0\nfi\nexit 1\n";
+        run_with_fake_herdr(script, &[], |state_dir| {
+            let config = Config::default();
+            let mut st = MonitorState::default();
+            assert!(poll_once("w1:p1", &config, &mut st)); // Refresh (live)
+            assert_eq!(
+                crate::state::load_registry().get("w1:p1").map(|s| s.value.as_str()),
+                Some("s1"),
+                "poll 1 must Refresh the live session"
+            );
+            assert!(poll_once("w1:p1", &config, &mut st)); // NoResume (logs)
+            assert!(poll_once("w1:p1", &config, &mut st)); // NoResume (quiet)
+            assert!(poll_once("w1:p1", &config, &mut st)); // NoResume (quiet)
+            let log = std::fs::read_to_string(state_dir.join("log.txt")).unwrap_or_default();
+            assert_eq!(
+                log.lines().filter(|l| l.contains("no resume argv")).count(),
+                1,
+                "identical NoResume polls must log once, got: {log}"
+            );
+        });
+    }
+
+    #[test]
+    fn poll_once_fallback_relaunch_is_one_shot() {
+        // Valueless fallback relaunches (kiro `chat -r`) carry no session
+        // to spend: the in-memory flag stops the loop instead. Expire the
+        // cooldown manually between polls to simulate time passing.
+        let script = "#!/bin/sh\necho \"$#:$@\" >> \"@CALL_LOG@\"\nif [ \"$1\" = \"pane\" ] && [ \"$2\" = \"get\" ]; then\necho '{\"id\":\"cli:pane:get\",\"result\":{\"pane\":{\"pane_id\":\"w9M:p1\",\"agent\":\"kiro\",\"agent_status\":\"unknown\"}}}'\nexit 0\nfi\nif [ \"$1\" = \"pane\" ] && [ \"$2\" = \"process-info\" ]; then\necho '{\"id\":\"cli:pane:process-info\",\"result\":{\"process_info\":{\"foreground_processes\":[{\"argv\":[\"/usr/bin/zsh\"]}]}}}'\nexit 0\nfi\nif [ \"$1\" = \"pane\" ] && [ \"$2\" = \"run\" ]; then\necho '{\"id\":\"cli:pane:run\",\"result\":{\"ok\":true}}'\nexit 0\nfi\nexit 1\n";
+        run_with_fake_herdr(script, &[], |state_dir| {
+            let config = Config::default();
+            let mut st = MonitorState::default();
+            assert!(poll_once("w9M:p1", &config, &mut st)); // fallback relaunch
+            assert!(st.cooldown_until.is_some());
+            st.cooldown_until = None; // simulate expiry
+            assert!(poll_once("w9M:p1", &config, &mut st)); // spent: skip
+            assert!(poll_once("w9M:p1", &config, &mut st)); // spent: skip
+            let calls = crate::test_support::herdr_calls(state_dir);
+            assert_eq!(
+                calls.lines().filter(|l| l.contains("pane run")).count(),
+                1,
+                "fallback must run exactly once, got: {calls}"
+            );
+            let log = std::fs::read_to_string(state_dir.join("log.txt")).unwrap_or_default();
+            assert_eq!(
+                log.lines().filter(|l| l.contains("fallback relaunch already spent")).count(),
+                1,
+                "spent fallback must log once, got: {log}"
+            );
+        });
+    }
+
+    #[test]
+    fn poll_once_refresh_rearms_fallback() {
+        // Fallback spent in poll 1, Refresh re-arms in poll 2, valued
+        // relaunch proceeds in poll 3. Per-call counters (separate get /
+        // info files beside the calls log) stage the three phases.
+        let script = "#!/bin/sh\nD=\"$(dirname \"@CALL_LOG@\")\"\nstep() {\nF=\"$D/$1\"\nn=$(cat \"$F\" 2>/dev/null || echo 0)\necho $((n + 1)) > \"$F\"\necho \"$n\"\n}\necho \"$#:$@\" >> \"@CALL_LOG@\"\nif [ \"$1\" = \"pane\" ] && [ \"$2\" = \"get\" ]; then\ncase \"$(step get)\" in\n0) echo '{\"id\":\"cli:pane:get\",\"result\":{\"pane\":{\"pane_id\":\"w9M:p1\",\"agent\":\"kiro\",\"agent_status\":\"unknown\"}}}' ;;\n1) echo '{\"id\":\"cli:pane:get\",\"result\":{\"pane\":{\"pane_id\":\"w9M:p1\",\"agent\":\"kiro\",\"agent_status\":\"working\",\"agent_session\":{\"agent\":\"kiro\",\"value\":\"sess-9\"}}}}' ;;\n*) echo '{\"id\":\"cli:pane:get\",\"result\":{\"pane\":{\"pane_id\":\"w9M:p1\",\"agent\":\"kiro\",\"agent_status\":\"unknown\"}}}' ;;\nesac\nexit 0\nfi\nif [ \"$1\" = \"pane\" ] && [ \"$2\" = \"process-info\" ]; then\ncase \"$(step info)\" in\n0) echo '{\"id\":\"cli:pane:process-info\",\"result\":{\"process_info\":{\"foreground_processes\":[{\"argv\":[\"/usr/bin/zsh\"]}]}}}' ;;\n1) echo '{\"id\":\"cli:pane:process-info\",\"result\":{\"process_info\":{\"foreground_processes\":[{\"argv\":[\"kiro-cli\",\"chat\",\"--resume-id\",\"sess-9\"]}]}}}' ;;\n*) echo '{\"id\":\"cli:pane:process-info\",\"result\":{\"process_info\":{\"foreground_processes\":[{\"argv\":[\"/usr/bin/zsh\"]}]}}}' ;;\nesac\nexit 0\nfi\nif [ \"$1\" = \"pane\" ] && [ \"$2\" = \"run\" ]; then\necho '{\"id\":\"cli:pane:run\",\"result\":{\"ok\":true}}'\nexit 0\nfi\nexit 1\n";
+        run_with_fake_herdr(script, &[], |state_dir| {
+            let config = Config::default();
+            let mut st = MonitorState::default();
+            assert!(poll_once("w9M:p1", &config, &mut st)); // fallback relaunch
+            st.cooldown_until = None;
+            assert!(poll_once("w9M:p1", &config, &mut st)); // Refresh re-arms
+            assert!(
+                !st.fallback_used,
+                "Refresh with a valued session must re-arm the fallback"
+            );
+            assert_eq!(
+                crate::state::load_registry().get("w9M:p1").map(|s| s.value.as_str()),
+                Some("sess-9")
+            );
+            st.cooldown_until = None;
+            assert!(poll_once("w9M:p1", &config, &mut st)); // valued relaunch
+            assert!(
+                st.fallback_used,
+                "valued relaunch must spend the fallback one-shot too"
+            );
+            let calls = crate::test_support::herdr_calls(state_dir);
+            assert_eq!(
+                calls.lines().filter(|l| l.contains("pane run")).collect::<Vec<_>>(),
+                vec![
+                    "4:pane run w9M:p1 kiro-cli chat -r",
+                    "4:pane run w9M:p1 kiro-cli chat --resume-id sess-9",
+                ],
+                "fallback then valued relaunch, got: {calls}"
+            );
+            assert!(
+                !crate::state::load_registry().contains_key("w9M:p1"),
+                "valued relaunch spends the entry"
+            );
+        });
+    }
+
+    #[test]
+    fn poll_once_relaunch_sets_cooldown() {
+        let script = "#!/bin/sh\necho \"$#:$@\" >> \"@CALL_LOG@\"\nif [ \"$1\" = \"pane\" ] && [ \"$2\" = \"get\" ]; then\necho '{\"id\":\"cli:pane:get\",\"result\":{\"pane\":{\"pane_id\":\"w1:p1\",\"agent_status\":\"unknown\"}}}'\nexit 0\nfi\nif [ \"$1\" = \"pane\" ] && [ \"$2\" = \"process-info\" ]; then\necho '{\"id\":\"cli:pane:process-info\",\"result\":{\"process_info\":{\"foreground_processes\":[{\"argv\":[\"/usr/bin/zsh\"]}]}}}'\nexit 0\nfi\nif [ \"$1\" = \"pane\" ] && [ \"$2\" = \"run\" ]; then\necho '{\"id\":\"cli:pane:run\",\"result\":{\"ok\":true}}'\nexit 0\nfi\nexit 1\n";
+        run_with_fake_herdr(script, &[], |state_dir| {
+            crate::state::remember(
+                "w1:p1",
+                SessionRef {
+                    agent: "claude".into(),
+                    value: "abc-123".into(),
+                },
+            );
+            let config = Config::default();
+            let mut st = MonitorState::default();
+            assert!(poll_once("w1:p1", &config, &mut st));
+            assert!(st.cooldown_until.is_some(), "successful relaunch sets cooldown");
             let log = std::fs::read_to_string(state_dir.join("log.txt"))
                 .expect("log exists");
             assert!(log.contains("relaunched claude"), "log names agent: {log}");
+            // Delivery proof (see `pane_run` docs): the full call sequence
+            // is exactly get + process-info + one joined `pane run`.
+            let calls = herdr_calls(state_dir);
+            assert_eq!(
+                calls.lines().collect::<Vec<_>>(),
+                vec![
+                    "3:pane get w1:p1",
+                    "4:pane process-info --pane w1:p1",
+                    "4:pane run w1:p1 claude --resume abc-123",
+                ],
+                "exact delivery sequence, got: {calls}"
+            );
         });
     }
 
     #[test]
     fn poll_once_process_info_failure_vetoes_relaunch() {
         let script = "#!/bin/sh\necho \"$1 $2 $3\" >> \"@CALL_LOG@\"\nif [ \"$1\" = \"pane\" ] && [ \"$2\" = \"get\" ]; then\necho '{\"id\":\"cli:pane:get\",\"result\":{\"pane\":{\"pane_id\":\"w1:p1\",\"agent_status\":\"unknown\"}}}'\nexit 0\nfi\nif [ \"$1\" = \"pane\" ] && [ \"$2\" = \"process-info\" ]; then\nexit 1\nfi\nexit 1\n";
-        with_poll_harness(script, |state_dir| {
+        run_with_fake_herdr(script, &[], |state_dir| {
             crate::state::remember(
                 "w1:p1",
                 SessionRef {
@@ -702,17 +960,21 @@ mod tests {
                 },
             );
             let config = Config::default();
-            let mut cooldown: Option<Instant> = None;
-            assert!(poll_once("w1:p1", &config, &mut cooldown));
-            assert_eq!(cooldown, None, "vetoed poll must not set cooldown");
-            let calls_path = state_dir.join("calls.log");
-            let calls = std::fs::read_to_string(&calls_path).expect("calls log exists");
+            let mut st = MonitorState::default();
+            assert!(poll_once("w1:p1", &config, &mut st));
+            assert_eq!(st.cooldown_until, None, "vetoed poll must not set cooldown");
+            assert!(poll_once("w1:p1", &config, &mut st)); // still vetoed
+            let calls = herdr_calls(state_dir);
             assert!(calls.contains("pane get"), "fake must have seen pane get: {calls}");
             assert!(calls.contains("pane process-info"), "fake must have seen process-info: {calls}");
             assert!(!calls.contains("pane run"), "no pane run may be invoked: {calls}");
             let log = std::fs::read_to_string(state_dir.join("log.txt"))
                 .expect("log exists");
-            assert!(log.contains("vetoing relaunch"), "log names veto: {log}");
+            assert_eq!(
+                log.lines().filter(|l| l.contains("vetoing relaunch")).count(),
+                1,
+                "repeat process-info failures must log once, got: {log}"
+            );
         });
     }
 
@@ -722,7 +984,7 @@ mod tests {
         // reports no agent_session): the poll must pin the freshest
         // `chat -l` id for the pane cwd into the registry.
         let script = "#!/bin/sh\nif [ \"$1\" = \"pane\" ] && [ \"$2\" = \"get\" ]; then\necho '{\"id\":\"cli:pane:get\",\"result\":{\"pane\":{\"pane_id\":\"w9M:p1\",\"agent\":\"kiro\",\"agent_status\":\"working\",\"cwd\":\"/\"}}}'\nexit 0\nfi\nif [ \"$1\" = \"pane\" ] && [ \"$2\" = \"process-info\" ]; then\necho '{\"id\":\"cli:pane:process-info\",\"result\":{\"process_info\":{\"foreground_processes\":[{\"argv\":[\"kiro-cli\",\"--resume\"]}]}}}'\nexit 0\nfi\nexit 1\n";
-        with_poll_harness(script, |state_dir| {
+        run_with_fake_herdr(script, &[], |state_dir| {
             let list = r#"[{"cwd":"/","sessions":[
                 {"sessionId":"sess-old-9","source":"v2","title":"old","updatedAt":"2026-09-15T20:00:00.000Z","messageCount":12},
                 {"sessionId":"sess-pinned-1","source":"v2","title":"live work","updatedAt":"2026-09-15T22:32:18.685Z","messageCount":44}
@@ -741,8 +1003,8 @@ mod tests {
             std::env::set_var("KIRO_BIN_PATH", &fake);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let config = Config::default();
-                let mut cooldown: Option<Instant> = None;
-                assert!(poll_once("w9M:p1", &config, &mut cooldown));
+                let mut st = MonitorState::default();
+                assert!(poll_once("w9M:p1", &config, &mut st));
                 let reg = crate::state::load_registry();
                 assert_eq!(
                     reg.get("w9M:p1")
@@ -760,7 +1022,7 @@ mod tests {
 
     #[test]
     fn finish_monitor_clears_lock_and_sentinel() {
-        with_poll_harness("#!/bin/sh\nexit 1\n", |_| {
+        run_with_fake_herdr("#!/bin/sh\nexit 1\n", &[], |_| {
             let pane_id = "w1:p1";
             let own_pid = 424243u32;
             assert!(crate::state::write_monitor_lock_pid(pane_id, own_pid));

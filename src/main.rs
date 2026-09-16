@@ -357,7 +357,7 @@ mod tests {
     }
 
     // ---- review-fix guards (hermetic: fake herdr + temp state dir) ----
-    use crate::test_support::run_with_fake_herdr;
+    use crate::test_support::{herdr_calls, run_with_fake_herdr};
 
     /// Fake `herdr`: logs argv to @CALL_LOG@, serves agentless panes for
     /// w1:argv / w1:evt, a live-agent pane with session for w9:live,
@@ -383,26 +383,12 @@ fi
 exit 0
 "#;
 
-    /// Run `f` with HERDR_BIN_PATH faked, state/config dirs isolated to a
-    /// fresh temp dir, and `extra` env vars set (`Some`) or removed
-    /// (`None`); everything is restored afterwards. Serialized on the
-    /// crate-wide `crate::test_support::lock_env` (env is process-global).
+    /// Run `f` with HERDR_BIN_PATH faked (default `FAKE_HERDR` script),
+    /// state/config dirs isolated to a fresh temp dir, and `extra` env
+    /// vars set (`Some`) or removed (`None`); everything is restored
+    /// afterwards. Serialized on the crate-wide `lock_env`.
     fn run_isolated(extra: &[(&str, Option<&str>)], f: impl FnOnce(&std::path::Path)) {
-        run_isolated_with_script(FAKE_HERDR, extra, f);
-    }
-
-    /// Thin wrapper over `crate::test_support::run_with_fake_herdr` (kept
-    /// so existing tests are untouched).
-    fn run_isolated_with_script(
-        script: &str,
-        extra: &[(&str, Option<&str>)],
-        f: impl FnOnce(&std::path::Path),
-    ) {
-        run_with_fake_herdr(script, extra, f);
-    }
-
-    fn herdr_calls(dir: &std::path::Path) -> String {
-        std::fs::read_to_string(dir.join("calls.log")).unwrap_or_default()
+        run_with_fake_herdr(FAKE_HERDR, extra, f);
     }
 
     #[test]
@@ -523,7 +509,7 @@ exit 1
 
     #[test]
     fn supervise_all_reports_herdr_failure() {
-        run_isolated_with_script(FAILING_HERDR, &[], |dir| {
+        run_with_fake_herdr(FAILING_HERDR, &[], |dir| {
             assert_eq!(supervise_all(), 1);
             assert!(herdr_calls(dir).contains("pane list"));
         });
@@ -544,7 +530,7 @@ exit 0
 
     #[test]
     fn supervise_all_skips_invalid_pane_id_without_touching_it() {
-        run_isolated_with_script(EVIL_LIST_HERDR, &[], |dir| {
+        run_with_fake_herdr(EVIL_LIST_HERDR, &[], |dir| {
             assert_eq!(supervise_all(), 0);
             let calls = herdr_calls(dir);
             assert!(
