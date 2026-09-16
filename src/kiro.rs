@@ -10,8 +10,9 @@
 //! it via the registry, so a later crash relaunches the valued
 //! `--resume-id` template.
 //!
-//! The list envelope carries no subagent flag; entries with zero messages
-//! (unresumable stubs) are skipped, and the most recently updated session
+//! The list envelope carries no subagent flag; entries explicitly
+//! reporting zero messages (unresumable stubs) are skipped — a missing
+//! count (v2 shape) is kept, not treated as zero — and the most recently updated session
 //! wins — a live primary re-saves on every turn, so it outranks stale
 //! subagent runs while its pane is alive.
 
@@ -81,8 +82,11 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 }
 
 /// Parse one `chat -l -f json` envelope (array of `{cwd, sessions}`) into
-/// resumable sessions. Zero-message stubs, unsafe ids, and unparsable
-/// timestamps are skipped (fail closed, survivors kept).
+/// resumable sessions. Entries explicitly reporting zero messages
+/// (unresumable stubs), unsafe ids, and unparsable timestamps are
+/// skipped (fail closed, survivors kept). A missing `messageCount`
+/// (the v2 store omits it entirely) is NOT a stub signal: the entry is
+/// kept and ranked by recency like the rest.
 pub fn sessions_from_list_output(raw: &str) -> Vec<KiroSession> {
     let v: serde_json::Value = match serde_json::from_str(raw) {
         Ok(v) => v,
@@ -103,11 +107,10 @@ pub fn sessions_from_list_output(raw: &str) -> Vec<KiroSession> {
             if !crate::resume::is_safe_session_value(id) {
                 continue;
             }
-            let count = s
-                .get("messageCount")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            if count == 0 {
+            // Explicit zero means an unresumable stub; a missing count
+            // (v2 shape) means unknown, not empty — keep it.
+            let count = s.get("messageCount").and_then(|v| v.as_u64());
+            if count == Some(0) {
                 continue;
             }
             let Some(updated) = s.get("updatedAt").and_then(|v| v.as_str()) else {
@@ -119,7 +122,7 @@ pub fn sessions_from_list_output(raw: &str) -> Vec<KiroSession> {
             out.push(KiroSession {
                 id: id.to_string(),
                 updated_at_ms,
-                message_count: count,
+                message_count: count.unwrap_or(0),
             });
         }
     }
@@ -203,6 +206,24 @@ mod tests {
         let newest = sessions.iter().max_by_key(|s| s.updated_at_ms).unwrap();
         assert_eq!(newest.id, "live-primary-aaa");
         assert_eq!(newest.message_count, 1729);
+    }
+
+    #[test]
+    fn keeps_v2_entries_without_message_count() {
+        // Live v2 shape (2026-09-16): the store omits `messageCount`
+        // entirely — all 600+ real sessions parsed from `chat -l`
+        // carry only sessionId/source/title/updatedAt. Missing count
+        // must not read as a zero-message stub.
+        const V2_LIST: &str = r#"[{"cwd":"/home/joseph/Projects/Lexmata/cardozo-ai","sessions":[
+            {"sessionId":"7d204a41-9bac-4530-a190-c4bbe12461f5","source":"v2","title":"rework this project to use DeepSeek4.1-flash as the mother model","updatedAt":"2026-09-16T01:02:32.859Z"},
+            {"sessionId":"cc417b43-2220-4bc6-b915-d42964ea450c","source":"v2","title":"older review","updatedAt":"2026-09-14T23:33:25.449Z"},
+            {"sessionId":"stub-explicit-zero","source":"v2","title":"(no title)","updatedAt":"2026-09-16T02:00:00.000Z","messageCount":0}
+        ]}]"#;
+        let sessions = sessions_from_list_output(V2_LIST);
+        assert_eq!(sessions.len(), 2, "both uncounted sessions kept: {sessions:?}");
+        let newest = sessions.iter().max_by_key(|s| s.updated_at_ms).unwrap();
+        assert_eq!(newest.id, "7d204a41-9bac-4530-a190-c4bbe12461f5");
+        assert_eq!(newest.message_count, 0, "unreported count defaults to 0");
     }
 
     #[test]

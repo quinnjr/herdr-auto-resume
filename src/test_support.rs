@@ -36,6 +36,12 @@ pub(crate) fn unique_temp_dir(prefix: &str) -> PathBuf {
     dir
 }
 
+/// Read the fake-herdr calls log (`@CALL_LOG@` target) under `state_dir`.
+/// Empty when the fake never logged (missing file is not an error).
+pub(crate) fn herdr_calls(state_dir: &std::path::Path) -> String {
+    std::fs::read_to_string(state_dir.join("calls.log")).unwrap_or_default()
+}
+
 /// Hermetic harness shared by main/monitor tests: fake `HERDR_BIN_PATH`
 /// plus isolated state/config dirs.
 ///
