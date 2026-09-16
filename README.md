@@ -29,19 +29,25 @@ Each supervised agent pane gets a polling **monitor**
    `COMMAND` value (embedded agent flags stay inert inside it — no
    `--` separator, which herdr types literally into the pane; see
    `pane_run` in `src/herdr.rs` for the verified herdr 0.8.2 rationale).
-   Resurrection is one-shot: a successful relaunch spends the saved
-   session, so an intentionally-exited agent stays dead after one
-   comeback — while a live agent re-saves every poll and re-arms the
-   next crash recovery. Failed delivery keeps the entry and retries.
-   Valueless fallback relaunches (e.g. `kiro-cli chat -r`) carry no
-   session to spend, so they are gated one-shot per monitor instead: a
-   later live Refresh (valued session known again) re-arms them. Any
-   successful relaunch, valued or fallback, spends the fallback
-   one-shot — otherwise a valued comeback plus another death would
-   resurrect twice.
-   Re-arming needs an observable live session (`agent_session`,
-   registry, or argv); an agent that never exposes one is not
-   re-armed and stays dead after its single fallback comeback.
+   Resurrection is exit-gated on POSIX shells: relaunches carry an
+   exit marker (`...; printf '@@AUTORESUME-EXIT:%s@@' "$?"`), and the
+   next death is classified from scrollback — clean exit (`:0`) spends
+   everything and stays dead with zero comebacks, while a crash
+   relaunches. The first death of an unwrapped run (or any death on
+   fish/nu/pwsh, which stay unwrapped) gets one wrapped comeback that
+   arms all future classification. A successful relaunch also spends
+   the saved session (failed delivery keeps it and retries), and
+   valueless fallback relaunches (e.g. `kiro-cli chat -r`) are gated
+   one-shot per monitor; a later live Refresh re-arms both. Re-arming
+   needs an observable live session (`agent_session`, registry, or
+   argv).
+3. When `resume_message` is set, the restored session also receives it
+   as a chat message: templates carrying `{message}` (kiro) deliver it
+   inline as chat input on resume; other templates get it two-step —
+   typed and submitted after a few polls once the TUI is plausibly
+   booted (opencode verified live; its `--prompt` neither submits nor
+   pre-fills on resume). The submit is skipped while the foreground is
+   idle (never type chat text into a shell) and attempted once.
 
 Monitors exit on a `stop-<pid>` sentinel (`stop` action). They are
 spawned detached but **without `setsid`/double-fork**, so they die with
@@ -111,14 +117,15 @@ or invalid JSON → defaults.
   "poll_seconds": 10,
   "cooldown_seconds": 300,
   "connect_grace_seconds": 120,
+  "resume_message": "continue",
   "commands": {
     "claude": "claude --resume {value}",
     "opencode": "opencode --session {value}",
     "codex": "codex resume {value}",
     "pi": "pi --session {value}",
     "hermes": "hermes --resume {value}",
-    "kiro": "kiro-cli chat --resume-id {value}",
-    "kiro-fallback": "kiro-cli chat -r"
+    "kiro": "kiro-cli chat --resume-id {value} {message}",
+    "kiro-fallback": "kiro-cli chat -r {message}"
   }
 }
 ```
@@ -127,6 +134,11 @@ or invalid JSON → defaults.
   known session; templates **without** it are valueless fallbacks usable
   with none. `<agent>-fallback` (e.g. `kiro-fallback`) is preferred over
   a valueless primary template when no value is known.
+- `{message}` is the `resume_message` setting, submitted as a chat
+  message with the relaunch (kiro delivers positional chat input into
+  the resumed session, verified live). Unset by default: the token is
+  dropped and templates render exactly as before. Multi-word messages
+  stay a single argv token (shell-quoted on delivery).
 - Session values are recovered from process argv via the resume flag
   derived from each template (`--resume {value}` → `--resume`, both
   `flag value` and `flag=value` forms).

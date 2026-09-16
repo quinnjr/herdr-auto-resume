@@ -17,6 +17,11 @@ pub struct Config {
     pub connect_grace_seconds: u64,
     #[serde(default = "default_commands")]
     pub commands: HashMap<String, String>,
+    /// Chat message submitted with every relaunch when the template
+    /// carries `{message}` (e.g. kiro's positional chat input). Unset by
+    /// default: templates render exactly as before until configured.
+    #[serde(default)]
+    pub resume_message: Option<String>,
 }
 
 fn default_poll_seconds() -> u64 {
@@ -38,6 +43,7 @@ impl Default for Config {
             cooldown_seconds: DEFAULT_COOLDOWN_SECONDS,
             connect_grace_seconds: DEFAULT_CONNECT_GRACE_SECONDS,
             commands: default_commands(),
+            resume_message: None,
         }
     }
 }
@@ -59,8 +65,8 @@ pub fn default_commands() -> HashMap<String, String> {
         ("codex".into(), "codex resume {value}".into()),
         ("pi".into(), "pi --session {value}".into()),
         ("hermes".into(), "hermes --resume {value}".into()),
-        ("kiro".into(), "kiro-cli chat --resume-id {value}".into()),
-        ("kiro-fallback".into(), "kiro-cli chat -r".into()),
+        ("kiro".into(), "kiro-cli chat --resume-id {value} {message}".into()),
+        ("kiro-fallback".into(), "kiro-cli chat -r {message}".into()),
     ])
 }
 
@@ -76,6 +82,8 @@ struct RawConfig {
     connect_grace_seconds: Option<u64>,
     #[serde(default)]
     commands: Option<HashMap<String, String>>,
+    #[serde(default)]
+    resume_message: Option<String>,
 }
 
 fn config_file_path() -> Option<PathBuf> {
@@ -132,6 +140,9 @@ pub fn load() -> Config {
     }
     if let Some(cmds) = raw.commands {
         config.commands.extend(cmds);
+    }
+    if let Some(msg) = raw.resume_message {
+        config.resume_message = Some(msg);
     }
     clamp(&mut config);
     config
@@ -201,6 +212,7 @@ mod tests {
             cooldown_seconds: 300,
             connect_grace_seconds: 99_999,
             commands: default_commands(),
+            resume_message: None,
         };
         clamp(&mut c);
         assert_eq!(c.poll_seconds, 1);
@@ -226,8 +238,8 @@ mod tests {
         let cmds = default_commands();
         assert_eq!(cmds["claude"], "claude --resume {value}");
         assert_eq!(cmds["opencode"], "opencode --session {value}");
-        assert_eq!(cmds["kiro"], "kiro-cli chat --resume-id {value}");
-        assert_eq!(cmds["kiro-fallback"], "kiro-cli chat -r");
+        assert_eq!(cmds["kiro"], "kiro-cli chat --resume-id {value} {message}");
+        assert_eq!(cmds["kiro-fallback"], "kiro-cli chat -r {message}");
     }
 
     #[test]
@@ -246,7 +258,7 @@ mod tests {
             assert_eq!(loaded.commands["claude"], "claude --yolo --resume {value}");
             // Defaults not overridden stay intact.
             assert_eq!(loaded.commands["opencode"], "opencode --session {value}");
-            assert_eq!(loaded.commands["kiro"], "kiro-cli chat --resume-id {value}");
+            assert_eq!(loaded.commands["kiro"], "kiro-cli chat --resume-id {value} {message}");
             std::fs::remove_dir_all(&dir).ok();
         });
     }

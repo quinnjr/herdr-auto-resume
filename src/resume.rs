@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use crate::herdr::{Pane, SessionRef};
 
 pub const VALUE_PLACEHOLDER: &str = "{value}";
+pub const MESSAGE_PLACEHOLDER: &str = "{message}";
 
 /// Split a command template into argv words, honouring single/double
 /// quotes and backslash escapes (outside single quotes).
@@ -179,11 +180,36 @@ pub fn session_from_argv(agent: &str, proc_argv: &[Vec<String>]) -> Option<Sessi
 /// valueless fallback usable without one. When no value is known, an
 /// explicit `<agent>-fallback` entry (e.g. `kiro-fallback`) is preferred
 /// over a valueless primary template. Unknown agent → None.
+///
+/// A template may also carry `{message}` (e.g. kiro's positional chat
+/// input): it is substituted with `message` when set, otherwise the
+/// token is dropped so unconfigured templates render exactly as before.
 pub fn resume_argv(
     agent: &str,
     value: Option<&str>,
     commands: &HashMap<String, String>,
+    message: Option<&str>,
 ) -> Option<Vec<String>> {
+    fn fill(template: &str, value: Option<&str>, message: Option<&str>) -> Vec<String> {
+        split_argv(template)
+            .into_iter()
+            .filter_map(|t| {
+                let had_message = t.contains(MESSAGE_PLACEHOLDER);
+                let mut t = t;
+                if let Some(v) = value {
+                    t = t.replace(VALUE_PLACEHOLDER, v);
+                }
+                t = t.replace(MESSAGE_PLACEHOLDER, message.unwrap_or_default());
+                // An unconfigured `{message}` vanishes; an explicit empty
+                // template arg (`""`) is preserved.
+                if t.is_empty() && had_message {
+                    None
+                } else {
+                    Some(t)
+                }
+            })
+            .collect()
+    }
     match value {
         Some(v) => {
             let template = commands.get(agent)?;
@@ -193,14 +219,9 @@ pub fn resume_argv(
                 }
                 // Split the template first, then substitute per token: the
                 // value is never re-split, so it cannot inject extra flags.
-                Some(
-                    split_argv(template)
-                        .into_iter()
-                        .map(|t| t.replace(VALUE_PLACEHOLDER, v))
-                        .collect(),
-                )
+                Some(fill(template, Some(v), message))
             } else {
-                Some(split_argv(template))
+                Some(fill(template, None, message))
             }
         }
         None => {
@@ -210,14 +231,14 @@ pub fn resume_argv(
                 // as absent and fall through to the primary template (None
                 // when it needs a value).
                 if !fb.is_empty() && !fb.contains(VALUE_PLACEHOLDER) {
-                    return Some(split_argv(fb));
+                    return Some(fill(fb, None, message));
                 }
             }
             let template = commands.get(agent)?;
             if template.contains(VALUE_PLACEHOLDER) {
                 return None;
             }
-            Some(split_argv(template))
+            Some(fill(template, None, message))
         }
     }
 }
@@ -267,7 +288,7 @@ mod tests {
     fn kiro_falls_back_to_valueless_resume() {
         let cmds = HashMap::from([("kiro".into(), "kiro-cli chat -r".into())]);
         assert_eq!(
-            resume_argv("kiro", None, &cmds).unwrap(),
+            resume_argv("kiro", None, &cmds, None).unwrap(),
             vec!["kiro-cli", "chat", "-r"]
         );
     }
@@ -275,9 +296,9 @@ mod tests {
     #[test]
     fn valued_template_requires_value() {
         let cmds = HashMap::from([("claude".into(), "claude --resume {value}".into())]);
-        assert!(resume_argv("claude", None, &cmds).is_none());
+        assert!(resume_argv("claude", None, &cmds, None).is_none());
         assert_eq!(
-            resume_argv("claude", Some("abc-123"), &cmds).unwrap(),
+            resume_argv("claude", Some("abc-123"), &cmds, None).unwrap(),
             vec!["claude", "--resume", "abc-123"]
         );
     }
@@ -306,21 +327,78 @@ mod tests {
         ]);
         // No value → valueless fallback template.
         assert_eq!(
-            resume_argv("kiro", None, &cmds).unwrap(),
+            resume_argv("kiro", None, &cmds, None).unwrap(),
             vec!["kiro-cli", "chat", "-r"]
         );
         // Known value → valued primary template.
         assert_eq!(
-            resume_argv("kiro", Some("sess-1"), &cmds).unwrap(),
+            resume_argv("kiro", Some("sess-1"), &cmds, None).unwrap(),
             vec!["kiro-cli", "chat", "--resume-id", "sess-1"]
+        );
+    }
+
+    #[test]
+    fn message_appended_when_template_carries_placeholder() {
+        let cmds = HashMap::from([(
+            "kiro".into(),
+            "kiro-cli chat --resume-id {value} {message}".into(),
+        )]);
+        // Live-verified 2026-09-16: positional input after `--resume-id`
+        // is delivered into the resumed session.
+        assert_eq!(
+            resume_argv("kiro", Some("sess-1"), &cmds, Some("continue")).unwrap(),
+            vec!["kiro-cli", "chat", "--resume-id", "sess-1", "continue"]
+        );
+        // Multi-word messages stay one argv token (shell-quoted downstream).
+        assert_eq!(
+            resume_argv("kiro", Some("sess-1"), &cmds, Some("pick up where you left off")).unwrap(),
+            vec!["kiro-cli", "chat", "--resume-id", "sess-1", "pick up where you left off"]
+        );
+        // Unset message: placeholder vanishes, argv identical to before.
+        assert_eq!(
+            resume_argv("kiro", Some("sess-1"), &cmds, None).unwrap(),
+            vec!["kiro-cli", "chat", "--resume-id", "sess-1"]
+        );
+        // Fallback path honors it too.
+        let cmds = HashMap::from([
+            ("kiro".into(), "kiro-cli chat --resume-id {value} {message}".into()),
+            ("kiro-fallback".into(), "kiro-cli chat -r {message}".into()),
+        ]);
+        assert_eq!(
+            resume_argv("kiro", None, &cmds, Some("continue")).unwrap(),
+            vec!["kiro-cli", "chat", "-r", "continue"]
+        );
+        assert_eq!(
+            resume_argv("kiro", None, &cmds, None).unwrap(),
+            vec!["kiro-cli", "chat", "-r"]
+        );
+    }
+
+    #[test]
+    fn message_absent_without_placeholder() {
+        // Templates without `{message}` ignore it entirely.
+        let cmds = HashMap::from([("claude".into(), "claude --resume {value}".into())]);
+        assert_eq!(
+            resume_argv("claude", Some("abc"), &cmds, Some("continue")).unwrap(),
+            vec!["claude", "--resume", "abc"]
+        );
+    }
+
+    #[test]
+    fn explicit_empty_template_arg_preserved() {
+        // Only `{message}`-derived empties drop; an explicit `""` stays.
+        let cmds = HashMap::from([("x".into(), "x \"\" {message}".into())]);
+        assert_eq!(
+            resume_argv("x", None, &cmds, None).unwrap(),
+            vec!["x", ""]
         );
     }
 
     #[test]
     fn unknown_agent_returns_none() {
         let cmds = HashMap::from([("claude".into(), "claude --resume {value}".into())]);
-        assert!(resume_argv("nope", Some("v"), &cmds).is_none());
-        assert!(resume_argv("nope", None, &cmds).is_none());
+        assert!(resume_argv("nope", Some("v"), &cmds, None).is_none());
+        assert!(resume_argv("nope", None, &cmds, None).is_none());
     }
 
     #[test]
@@ -422,18 +500,18 @@ mod tests {
         let cmds = HashMap::from([("claude".into(), "claude --resume {value}".into())]);
         // Ordinary ids substitute as a single token.
         assert_eq!(
-            resume_argv("claude", Some("abc-123"), &cmds).unwrap(),
+            resume_argv("claude", Some("abc-123"), &cmds, None).unwrap(),
             vec!["claude", "--resume", "abc-123"]
         );
         // Flag injection via embedded whitespace is rejected.
         assert!(
-            resume_argv("claude", Some("x --dangerously-skip-permissions"), &cmds).is_none()
+            resume_argv("claude", Some("x --dangerously-skip-permissions"), &cmds, None).is_none()
         );
         // Shell metacharacters are rejected.
-        assert!(resume_argv("claude", Some("a;b"), &cmds).is_none());
-        assert!(resume_argv("claude", Some(""), &cmds).is_none());
-        assert!(resume_argv("claude", Some("a\"b"), &cmds).is_none());
-        assert!(resume_argv("claude", Some("a\\b"), &cmds).is_none());
+        assert!(resume_argv("claude", Some("a;b"), &cmds, None).is_none());
+        assert!(resume_argv("claude", Some(""), &cmds, None).is_none());
+        assert!(resume_argv("claude", Some("a\"b"), &cmds, None).is_none());
+        assert!(resume_argv("claude", Some("a\\b"), &cmds, None).is_none());
     }
 
     #[test]
@@ -482,7 +560,7 @@ mod tests {
             ("kiro-fallback".into(), "kiro-cli chat --resume {value}".into()),
         ]);
         // Never emit a literal `{value}` token.
-        assert!(resume_argv("kiro", None, &cmds).is_none());
+        assert!(resume_argv("kiro", None, &cmds, None).is_none());
     }
 
     #[test]
@@ -494,11 +572,11 @@ mod tests {
     fn valueless_template_ignores_unused_value_safety() {
         let cmds = HashMap::from([("claude".into(), "claude --continue".into())]);
         assert_eq!(
-            resume_argv("claude", Some("a;b"), &cmds).unwrap(),
+            resume_argv("claude", Some("a;b"), &cmds, None).unwrap(),
             vec!["claude", "--continue"]
         );
         assert_eq!(
-            resume_argv("claude", Some("--evil"), &cmds).unwrap(),
+            resume_argv("claude", Some("--evil"), &cmds, None).unwrap(),
             vec!["claude", "--continue"]
         );
     }
@@ -509,6 +587,6 @@ mod tests {
             ("kiro".into(), "kiro-cli chat --resume-id {value}".into()),
             ("kiro-fallback".into(), "".into()),
         ]);
-        assert!(resume_argv("kiro", None, &cmds).is_none());
+        assert!(resume_argv("kiro", None, &cmds, None).is_none());
     }
 }
