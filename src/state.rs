@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+
 use crate::config;
 use crate::herdr::SessionRef;
 
@@ -123,6 +125,53 @@ pub fn remember(pane_id: &str, session: SessionRef) {
 }
 
 use crate::resume::is_safe_session_value;
+
+/// The shell an agent was last seen running under, per pane. `live`
+/// stays true while that agent is the pane's job; an exit inside the
+/// same shell (Ctrl-C, `/exit`) retires it. Only a live record whose
+/// shell has since been replaced — the session host crashed or
+/// restarted — licenses a relaunch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellRecord {
+    pub shell: String,
+    pub live: bool,
+}
+
+fn shells_path() -> PathBuf {
+    config::state_dir().join("shells.json")
+}
+
+/// Load the pane-id -> shell record map. Missing file, unreadable file,
+/// or invalid JSON yields an empty map (no record never relaunches).
+pub fn load_shells() -> HashMap<String, ShellRecord> {
+    std::fs::read_to_string(shells_path())
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+pub fn shell_record(pane_id: &str) -> Option<ShellRecord> {
+    load_shells().remove(pane_id)
+}
+
+/// Record (or overwrite) the shell record for a pane, atomically via
+/// `shells.json.tmp` + rename. Skips the write when unchanged (monitors
+/// call this every poll while the agent is alive).
+pub fn record_shell(pane_id: &str, record: ShellRecord) {
+    let mut shells = load_shells();
+    if shells.get(pane_id) == Some(&record) {
+        return;
+    }
+    shells.insert(pane_id.to_string(), record);
+    let dir = config::state_dir();
+    std::fs::create_dir_all(&dir).ok();
+    let text = serde_json::to_string(&shells).unwrap_or_else(|_| "{}".to_string());
+    let tmp = dir.join("shells.json.tmp");
+    if std::fs::write(&tmp, text).is_err() {
+        return;
+    }
+    std::fs::rename(&tmp, shells_path()).ok();
+}
 
 /// Legacy lock-file path (`:` -> `_`), kept for migration from the
 /// pre-encoding layout. New code writes via [`monitor_lock_path`]; reads
@@ -463,7 +512,7 @@ fn cmdline_is_monitor_for_pane(cmdline: &str, pane_id: &str) -> bool {
     }
     let mut has_monitor = false;
     let mut has_pane = false;
-    for tok in cmdline.split(|c| c == '\0' || c == ' ') {
+    for tok in cmdline.split(['\0', ' ']) {
         if tok == "monitor" {
             has_monitor = true;
         }
@@ -598,6 +647,21 @@ mod tests {
             assert!(!reg.contains_key("w7G:p1"));
             assert_eq!(reg["w7G:p2"].value, "sess-2");
             assert!(dir.join("registry.json").exists());
+        });
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn shell_records_round_trip_per_pane() {
+        let dir = with_temp_state_dir(|dir| {
+            assert_eq!(shell_record("w7G:p1"), None);
+            let live = ShellRecord { shell: "100@b:7".into(), live: true };
+            record_shell("w7G:p1", live.clone());
+            record_shell("w7G:p2", ShellRecord { shell: "200".into(), live: false });
+            assert_eq!(shell_record("w7G:p1"), Some(live));
+            assert_eq!(shell_record("w7G:p2").map(|r| r.live), Some(false));
+            std::fs::write(dir.join("shells.json"), "not json").expect("corrupt");
+            assert_eq!(shell_record("w7G:p1"), None, "corrupt file reads as empty");
         });
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -912,11 +976,23 @@ mod tests {
         use std::os::unix::process::CommandExt;
         let marker = our_binary_marker();
         let fake_arg0 = format!("{marker} monitor {pane_id}");
-        std::process::Command::new("sleep")
+        let child = std::process::Command::new("sleep")
             .arg("60")
-            .arg0(fake_arg0)
+            .arg0(&fake_arg0)
             .spawn()
-            .expect("spawn sleep")
+            .expect("spawn sleep");
+        // Between fork and exec the child's cmdline is still ours; wait
+        // (bounded) until the exec'd argv is visible to `/proc` readers.
+        let cmdline = format!("/proc/{}/cmdline", child.id());
+        for _ in 0..200 {
+            if std::fs::read(&cmdline)
+                .is_ok_and(|c| c.starts_with(fake_arg0.as_bytes()))
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        child
     }
 
     #[test]
