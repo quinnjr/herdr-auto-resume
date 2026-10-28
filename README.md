@@ -29,18 +29,23 @@ Each supervised agent pane gets a polling **monitor**
    `COMMAND` value (embedded agent flags stay inert inside it — no
    `--` separator, which herdr types literally into the pane; see
    `pane_run` in `src/herdr.rs` for the verified herdr 0.8.2 rationale).
-   Resurrection is exit-gated on POSIX shells: relaunches carry an
-   exit marker (`...; printf '@@AUTORESUME-EXIT:%s@@' "$?"`), and the
-   next death is classified from scrollback — clean exit (`:0`) spends
-   everything and stays dead with zero comebacks, while a crash
-   relaunches. The first death of an unwrapped run (or any death on
-   fish/nu/pwsh, which stay unwrapped) gets one wrapped comeback that
-   arms all future classification. A successful relaunch also spends
-   the saved session (failed delivery keeps it and retries), and
-   valueless fallback relaunches (e.g. `kiro-cli chat -r`) are gated
-   one-shot per monitor; a later live Refresh re-arms both. Re-arming
-   needs an observable live session (`agent_session`, registry, or
-   argv).
+   Resurrection is **host-restart-gated**: an idle shell looks the same
+   after a Ctrl-C and after the session host crashed, but the shell
+   itself does not. While the agent runs, the monitor records the
+   pane's shell identity (`shell_pid` from `process-info`, plus boot id
+   and process start time on Linux so a recycled pid or a reboot never
+   matches). When the pane goes idle:
+   - **different shell** than the one the agent was seen in → the host
+     crashed or restarted → resume;
+   - **same shell** → the agent exited inside it (Ctrl-C, `/exit`, a
+     clean quit, or the agent itself dying) → stay dead, and the record
+     is retired so a later host restart does not resurrect it either;
+   - **no record** (never seen running) or **no shell id** → stay dead
+     (fail closed).
+   A relaunch pins the current shell, so the resumed agent's next
+   in-place death is a user exit again: one comeback per host restart.
+   A successful relaunch also spends the saved session (failed delivery
+   keeps it and retries); a later live Refresh re-arms it.
 3. When `resume_message` is set, the restored session also receives it
    as a chat message: templates carrying `{message}` (kiro) deliver it
    inline as chat input on resume; other templates get it two-step —
@@ -150,7 +155,8 @@ or invalid JSON → defaults.
 ## State
 
 Under the plugin config/state dir: `registry.json` (pane → session),
-`monitors/<pane>.json` (monitor locks, `:` → `_`), `stop-<pid>`
+`shells.json` (pane → shell the agent was last seen in, and whether it
+is still live), `monitors/<pane>.json` (monitor locks, `:` → `_`), `stop-<pid>`
 sentinels, `log.txt`. Override dir with `HERDR_PLUGIN_CONFIG_DIR`
 (tests, dev) or `HERDR_BIN_PATH` (fake `herdr` binary).
 
