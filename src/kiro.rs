@@ -28,7 +28,7 @@ pub struct KiroSession {
 }
 
 fn kiro_bin() -> String {
-    std::env::var("KIRO_BIN_PATH").unwrap_or_else(|_| "kiro-cli".to_string())
+    crate::config::env_string("KIRO_BIN_PATH").unwrap_or_else(|| "kiro-cli".to_string())
 }
 
 /// Parse `2026-09-15T22:32:18.685Z` (millis optional) to unix millis.
@@ -47,6 +47,11 @@ fn parse_updated_at(s: &str) -> Option<i64> {
     }
     let (hms, millis): (&str, i64) = match time.split_once('.') {
         Some((h, frac)) => {
+            // ASCII digits only: a sign or multi-byte char must fail
+            // closed, never parse or panic on the byte slice below.
+            if frac.is_empty() || !frac.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
             let ms: i64 = format!("{frac:0<3}")[..3].parse().ok()?;
             (h, ms)
         }
@@ -81,13 +86,54 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146097 + doe - 719468
 }
 
+/// Normalise a directory path for envelope matching: trailing `/`
+/// trimmed (the root stays `/`).
+fn normalize_dir(p: &str) -> &str {
+    let t = p.trim_end_matches('/');
+    if t.is_empty() && p.starts_with('/') {
+        "/"
+    } else {
+        t
+    }
+}
+
+/// True when an envelope's `cwd` names the pane's directory: equal
+/// after trailing-slash normalisation, equal to the pane cwd's canonical
+/// path (kiro reports the canonical cwd of a symlinked pane cwd, whatever
+/// its basename), or equal after canonicalising the envelope too.
+/// Exact only — an ancestor or descendant folder's sessions are never
+/// the pane's. Only envelopes sharing the pane cwd's final component are
+/// canonicalised (one stat chain per candidate, not per envelope), so an
+/// envelope naming a symlinked alias with a different basename is an
+/// accepted miss. A relative envelope cwd never matches (it would
+/// resolve against this process's cwd, not kiro's).
+fn same_dir(envelope: &str, pane: &str, pane_canonical: Option<&std::path::Path>) -> bool {
+    if !envelope.starts_with('/') {
+        return false;
+    }
+    let (envelope, pane) = (normalize_dir(envelope), normalize_dir(pane));
+    fn basename(p: &str) -> &str {
+        p.rsplit('/').next().unwrap_or_default()
+    }
+    envelope == pane
+        || pane_canonical.is_some_and(|p| std::path::Path::new(envelope) == p)
+        || (basename(envelope) == basename(pane)
+            && pane_canonical
+                .is_some_and(|p| std::fs::canonicalize(envelope).is_ok_and(|e| e == p)))
+}
+
 /// Parse one `chat -l -f json` envelope (array of `{cwd, sessions}`) into
-/// resumable sessions. Entries explicitly reporting zero messages
+/// resumable sessions for `cwd`. Only envelopes naming the pane's
+/// directory exactly ([`same_dir`]) are used; a parent, subfolder or
+/// unrelated folder's, or one without `cwd`, never is, so with none
+/// matching this returns nothing (fail closed: no pin, and relaunch
+/// falls back to kiro's own cwd resolution). Entries explicitly
+/// reporting zero messages
 /// (unresumable stubs), unsafe ids, and unparsable timestamps are
 /// skipped (fail closed, survivors kept). A missing `messageCount`
 /// (the v2 store omits it entirely) is NOT a stub signal: the entry is
 /// kept and ranked by recency like the rest.
-pub fn sessions_from_list_output(raw: &str) -> Vec<KiroSession> {
+pub fn sessions_from_list_output(raw: &str, cwd: &str) -> Vec<KiroSession> {
     let v: serde_json::Value = match serde_json::from_str(raw) {
         Ok(v) => v,
         Err(_) => return vec![],
@@ -95,8 +141,14 @@ pub fn sessions_from_list_output(raw: &str) -> Vec<KiroSession> {
     let Some(arr) = v.as_array() else {
         return vec![];
     };
+    let pane_canonical = std::fs::canonicalize(cwd).ok();
+    let envelopes = arr.iter().filter(|env| {
+        env.get("cwd")
+            .and_then(|c| c.as_str())
+            .is_some_and(|c| same_dir(c, cwd, pane_canonical.as_deref()))
+    });
     let mut out = Vec::new();
-    for env in arr {
+    for env in envelopes {
         let Some(sessions) = env.get("sessions").and_then(|s| s.as_array()) else {
             continue;
         };
@@ -180,7 +232,7 @@ fn run_list(cwd: &str) -> Option<String> {
 /// nothing usable. Pure selection over `sessions_from_list_output`.
 pub fn latest_session_for_cwd(cwd: &str) -> Option<String> {
     let raw = run_list(cwd)?;
-    sessions_from_list_output(&raw)
+    sessions_from_list_output(&raw, cwd)
         .into_iter()
         .max_by_key(|s| s.updated_at_ms)
         .map(|s| s.id)
@@ -199,9 +251,11 @@ mod tests {
         {"sessionId":"bad id with spaces","source":"v2","title":"evil","updatedAt":"2026-09-15T22:33:00.000Z","messageCount":5}
     ]}]"#;
 
+    const CONDUKT: &str = "/home/joseph/Projects/Lexmata/condukt";
+
     #[test]
     fn skips_stubs_and_picks_freshest() {
-        let sessions = sessions_from_list_output(MIXED_LIST);
+        let sessions = sessions_from_list_output(MIXED_LIST, CONDUKT);
         assert_eq!(sessions.len(), 2);
         let newest = sessions.iter().max_by_key(|s| s.updated_at_ms).unwrap();
         assert_eq!(newest.id, "live-primary-aaa");
@@ -219,8 +273,13 @@ mod tests {
             {"sessionId":"cc417b43-2220-4bc6-b915-d42964ea450c","source":"v2","title":"older review","updatedAt":"2026-09-14T23:33:25.449Z"},
             {"sessionId":"stub-explicit-zero","source":"v2","title":"(no title)","updatedAt":"2026-09-16T02:00:00.000Z","messageCount":0}
         ]}]"#;
-        let sessions = sessions_from_list_output(V2_LIST);
-        assert_eq!(sessions.len(), 2, "both uncounted sessions kept: {sessions:?}");
+        let sessions =
+            sessions_from_list_output(V2_LIST, "/home/joseph/Projects/Lexmata/cardozo-ai/");
+        assert_eq!(
+            sessions.len(),
+            2,
+            "both uncounted sessions kept: {sessions:?}"
+        );
         let newest = sessions.iter().max_by_key(|s| s.updated_at_ms).unwrap();
         assert_eq!(newest.id, "7d204a41-9bac-4530-a190-c4bbe12461f5");
         assert_eq!(newest.message_count, 0, "unreported count defaults to 0");
@@ -228,10 +287,113 @@ mod tests {
 
     #[test]
     fn rejects_garbage_envelopes() {
-        assert!(sessions_from_list_output("not json").is_empty());
-        assert!(sessions_from_list_output(r#"{"sessions":[]}"#).is_empty());
-        assert!(sessions_from_list_output(r#"[{"cwd":"x"}]"#).is_empty());
-        assert!(sessions_from_list_output(r#"[{"cwd":"x","sessions":[{"sessionId":"ok-id","updatedAt":"yesterday","messageCount":3}]}]"#).is_empty());
+        assert!(sessions_from_list_output("not json", "x").is_empty());
+        assert!(sessions_from_list_output(r#"{"sessions":[]}"#, "x").is_empty());
+        assert!(sessions_from_list_output(r#"[{"cwd":"x"}]"#, "x").is_empty());
+        assert!(sessions_from_list_output(r#"[{"cwd":"x","sessions":[{"sessionId":"ok-id","updatedAt":"yesterday","messageCount":3}]}]"#, "x").is_empty());
+    }
+
+    #[test]
+    fn ignores_newer_session_from_another_cwd() {
+        // Two envelopes: the newest session lives in a different folder
+        // and must never be pinned to this pane.
+        const TWO: &str = r#"[
+            {"cwd":"/work/a","sessions":[{"sessionId":"a-older","updatedAt":"2026-09-15T20:00:00.000Z","messageCount":3}]},
+            {"cwd":"/work/b","sessions":[{"sessionId":"b-newer","updatedAt":"2026-09-15T23:00:00.000Z","messageCount":9}]}
+        ]"#;
+        let sessions = sessions_from_list_output(TWO, "/work/a/");
+        assert_eq!(
+            sessions.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            vec!["a-older"]
+        );
+    }
+
+    #[test]
+    fn uses_only_envelopes_naming_cwd_exactly() {
+        const LIST: &str = r#"[
+            {"cwd":"/repo","sessions":[{"sessionId":"repo","updatedAt":"2026-09-15T20:00:00.000Z","messageCount":3}]},
+            {"cwd":"/","sessions":[{"sessionId":"root","updatedAt":"2026-09-15T21:00:00.000Z","messageCount":3}]},
+            {"cwd":"/repo/sub/vendor","sessions":[{"sessionId":"below","updatedAt":"2026-09-15T22:00:00.000Z","messageCount":3}]},
+            {"sessions":[{"sessionId":"no-cwd","updatedAt":"2026-09-15T23:00:00.000Z","messageCount":9}]}
+        ]"#;
+        let ids = |raw: &str, cwd: &str| {
+            sessions_from_list_output(raw, cwd)
+                .into_iter()
+                .map(|s| s.id)
+                .collect::<Vec<_>>()
+        };
+        // Exact match (trailing slash normalised) is used.
+        assert_eq!(ids(LIST, "/repo/"), vec!["repo"]);
+        // A parent (`/repo`, `/`) or subfolder envelope never stands in
+        // for a `/repo/sub` pane: nothing, so no pin.
+        assert!(ids(LIST, "/repo/sub").is_empty());
+        // `/repo` and `/repository` are unrelated.
+        assert!(ids(LIST, "/repository").is_empty());
+    }
+
+    #[test]
+    fn matches_cwd_through_symlink() {
+        let dir = crate::test_support::unique_temp_dir("kiro-symlink");
+        let real = dir.join("real/proj");
+        std::fs::create_dir_all(&real).expect("mkdir");
+        std::fs::create_dir_all(dir.join("alias")).expect("mkdir");
+        let link = dir.join("alias/proj");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        // A differently named alias is an accepted miss (never canonicalised).
+        let renamed = dir.join("renamed");
+        std::os::unix::fs::symlink(&real, &renamed).expect("symlink");
+        let list = format!(
+            r#"[{{"cwd":"{}","sessions":[{{"sessionId":"via-link","updatedAt":"2026-09-15T20:00:00.000Z","messageCount":3}}]}},{{"cwd":"{}","sessions":[{{"sessionId":"via-renamed","updatedAt":"2026-09-15T20:00:00.000Z","messageCount":3}}]}}]"#,
+            link.display(),
+            renamed.display()
+        );
+        let sessions = sessions_from_list_output(&list, &real.to_string_lossy());
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            sessions.into_iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec!["via-link"]
+        );
+    }
+
+    #[test]
+    fn relative_envelope_cwd_never_matches() {
+        let dir = crate::test_support::unique_temp_dir("kiro-relative");
+        let real = dir.join("proj");
+        std::fs::create_dir_all(&real).expect("mkdir");
+        let canonical = std::fs::canonicalize(&real).ok();
+        let pane = real.to_string_lossy().into_owned();
+        let hit = same_dir("proj", &pane, canonical.as_deref()) || same_dir("proj", "proj", None);
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(!hit);
+    }
+
+    #[test]
+    fn symlinked_pane_cwd_matches_canonical_envelope() {
+        // Pane cwd is a symlink whose basename differs from its target;
+        // kiro reports the canonical cwd.
+        let dir = crate::test_support::unique_temp_dir("kiro-symlink-pane");
+        let real = dir.join("real/proj");
+        std::fs::create_dir_all(&real).expect("mkdir");
+        let pane = dir.join("work");
+        std::os::unix::fs::symlink(&real, &pane).expect("symlink");
+        let canonical = std::fs::canonicalize(&real).expect("canonicalize");
+        let list = format!(
+            r#"[{{"cwd":"{}","sessions":[{{"sessionId":"canon","updatedAt":"2026-09-15T20:00:00.000Z","messageCount":3}}]}}]"#,
+            canonical.display()
+        );
+        let sessions = sessions_from_list_output(&list, &pane.to_string_lossy());
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            sessions.into_iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec!["canon"]
+        );
+    }
+
+    #[test]
+    fn updated_at_rejects_non_digit_fractions() {
+        assert!(parse_updated_at("2026-09-15T22:32:18.\u{e9}\u{e9}Z").is_none());
+        assert!(parse_updated_at("2026-09-15T22:32:18.-5Z").is_none());
+        assert!(parse_updated_at("2026-09-15T22:32:18.Z").is_none());
     }
 
     #[test]
@@ -251,41 +413,34 @@ mod tests {
     fn latest_session_uses_fake_kiro_bin() {
         use crate::test_support::lock_env;
         let _guard = lock_env();
-        let prev = std::env::var_os("KIRO_BIN_PATH");
+        let _restore = crate::test_support::EnvRestore::capture(["KIRO_BIN_PATH"]);
         let dir = crate::test_support::unique_temp_dir("kiro-test");
         let fake = dir.join("kiro-cli");
         std::fs::write(
             &fake,
-            format!("#!/bin/sh\necho \"$@\" >> \"{log}\"\ncat \"{fixture}\"\n",
+            format!(
+                "#!/bin/sh\necho \"$@\" >> \"{log}\"\ncat \"{fixture}\"\n",
                 log = dir.join("calls.log").display(),
-                fixture = dir.join("list.json").display()),
+                fixture = dir.join("list.json").display()
+            ),
         )
         .expect("write fake");
-        std::fs::write(dir.join("list.json"), MIXED_LIST).expect("fixture");
+        std::fs::write(dir.join("list.json"), MIXED_LIST.replace(CONDUKT, "/tmp"))
+            .expect("fixture");
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         std::env::set_var("KIRO_BIN_PATH", &fake);
-        let result = std::panic::catch_unwind(|| latest_session_for_cwd("/tmp"));
-        match prev {
-            Some(v) => std::env::set_var("KIRO_BIN_PATH", v),
-            None => std::env::remove_var("KIRO_BIN_PATH"),
-        }
+        let result = latest_session_for_cwd("/tmp");
         std::fs::remove_dir_all(&dir).ok();
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().as_deref(), Some("live-primary-aaa"));
+        assert_eq!(result.as_deref(), Some("live-primary-aaa"));
     }
 
     #[test]
     fn latest_session_none_when_bin_missing() {
         use crate::test_support::lock_env;
         let _guard = lock_env();
-        let prev = std::env::var_os("KIRO_BIN_PATH");
+        let _restore = crate::test_support::EnvRestore::capture(["KIRO_BIN_PATH"]);
         std::env::set_var("KIRO_BIN_PATH", "/nonexistent-kiro-bin-xyz/kiro-cli");
-        let result = latest_session_for_cwd("/tmp");
-        match prev {
-            Some(v) => std::env::set_var("KIRO_BIN_PATH", v),
-            None => std::env::remove_var("KIRO_BIN_PATH"),
-        }
-        assert_eq!(result, None);
+        assert_eq!(latest_session_for_cwd("/tmp"), None);
     }
 }
