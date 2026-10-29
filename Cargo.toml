@@ -2,6 +2,7 @@
 name = "auto-resume"
 version = "0.6.0"
 edition = "2021"
+rust-version = "1.89"
 description = "Relaunch dead Herdr agent panes into their previous sessions (claude, opencode, kiro-cli)"
 license = "MIT"
 repository = "https://github.com/quinnjr/herdr-auto-resume"

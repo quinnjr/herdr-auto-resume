@@ -19,10 +19,11 @@ const DOTFILE: &str = ".claude-profile";
 /// `~/.local/share/claude-profiles`), when it is installed (the dir
 /// exists).
 pub fn data_dir() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .filter(|v| !v.is_empty())
+    let base = crate::config::env_nonempty("XDG_DATA_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))?;
+        .or_else(|| {
+            crate::config::env_nonempty("HOME").map(|h| PathBuf::from(h).join(".local/share"))
+        })?;
     let data = base.join("claude-profiles");
     data.is_dir().then_some(data)
 }
@@ -105,16 +106,12 @@ mod tests {
     #[test]
     fn data_dir_follows_xdg_data_home_and_requires_install() {
         let _guard = crate::test_support::lock_env();
-        let prev = std::env::var_os("XDG_DATA_HOME");
+        let _restore = crate::test_support::EnvRestore::capture(["XDG_DATA_HOME"]);
         let xdg = unique_temp_dir("xdg");
         std::env::set_var("XDG_DATA_HOME", &xdg);
         let missing = data_dir();
         std::fs::create_dir_all(xdg.join("claude-profiles")).expect("data dir");
         let present = data_dir();
-        match prev {
-            Some(v) => std::env::set_var("XDG_DATA_HOME", v),
-            None => std::env::remove_var("XDG_DATA_HOME"),
-        }
         std::fs::remove_dir_all(&xdg).ok();
         assert_eq!(missing, None, "not installed: no data dir");
         assert_eq!(present, Some(xdg.join("claude-profiles")));
