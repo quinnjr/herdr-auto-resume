@@ -341,6 +341,88 @@ fn maybe_pin_kiro_session(pane: &Pane) {
     );
 }
 
+/// Pid of the foreground Claude process (`name`, or argv[0] basename),
+/// as herdr's `process-info` reports it.
+fn claude_pid(info: &serde_json::Value) -> Option<u32> {
+    info.get("foreground_processes")?
+        .as_array()?
+        .iter()
+        .find(|p| {
+            p.get("name").and_then(serde_json::Value::as_str) == Some("claude")
+                || p.get("argv")
+                    .and_then(|a| a.get(0))
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|a0| a0.rsplit('/').next() == Some("claude"))
+        })?
+        .get("pid")?
+        .as_u64()
+        .and_then(|p| u32::try_from(p).ok())
+}
+
+/// claude-profile capture (thin I/O wrapper around
+/// [`crate::claude_profile`]): while Claude runs under a managed
+/// profile, remember that profile, and — since herdr only sees the
+/// default profile's sessions — its session id when herdr reports none.
+/// A config dir that is not a managed profile is left alone: a resume
+/// could not reach its sessions.
+fn maybe_capture_claude(pane: &Pane, info: &serde_json::Value) {
+    let Some(data) = crate::claude_profile::data_dir() else {
+        return;
+    };
+    let Some(pid) = claude_pid(info) else {
+        return;
+    };
+    let Some(config) = crate::claude_profile::config_dir_of(pid) else {
+        return;
+    };
+    let Some(profile) = crate::claude_profile::profile_of_config_dir(&data, &config) else {
+        return;
+    };
+    crate::state::record_profile(&pane.pane_id, &profile);
+    if pane.agent_session.is_none() {
+        if let Some(id) = crate::claude_profile::session_of(&config, pid) {
+            crate::state::remember(
+                &pane.pane_id,
+                SessionRef { agent: "claude".into(), value: id },
+            );
+        }
+    }
+}
+
+/// `claude --profile <name> ...` when the session ran under a profile
+/// other than the default (the `claude` wrapper's own flag); otherwise
+/// the argv unchanged, so default-profile resumes stay plain.
+fn with_claude_profile(
+    agent: &str,
+    mut argv: Vec<String>,
+    profile: Option<&str>,
+    default: Option<&str>,
+) -> Vec<String> {
+    if let Some(p) = profile {
+        if agent == "claude" && Some(p) != default && !argv.is_empty() {
+            argv.splice(1..1, ["--profile".to_string(), p.to_string()]);
+        }
+    }
+    argv
+}
+
+/// The profile to resume a pane's Claude under: the one it was seen
+/// running under, else the nearest `.claude-profile` from the pane cwd;
+/// with the default, for [`with_claude_profile`]. Nothing without
+/// claude-profile installed.
+fn resume_profile(pane: &Pane) -> (Option<String>, Option<String>) {
+    let Some(data) = crate::claude_profile::data_dir() else {
+        return (None, None);
+    };
+    let profile = crate::state::profile_for(&pane.pane_id).or_else(|| {
+        pane.cwd
+            .as_deref()
+            .filter(|c| !c.is_empty())
+            .and_then(|c| crate::claude_profile::dotfile_profile(&data, std::path::Path::new(c)))
+    });
+    (profile, crate::claude_profile::default_profile(&data))
+}
+
 /// Per-monitor mutable poll state: the post-relaunch cooldown, the
 /// last-logged `NoResume` signature (repeat identical no-resume polls
 /// stay quiet), and the warn-once marker for repetitive failure logs.
@@ -509,6 +591,9 @@ fn poll_once(pane_id: &str, config: &Config, st: &mut MonitorState) -> bool {
     };
     // Kiro session pinning (best-effort discovery; registry reloaded after).
     maybe_pin_kiro_session(&pane);
+    if let Some(info) = &info {
+        maybe_capture_claude(&pane, info);
+    }
     let reg = crate::state::load_registry();
     let shell = info.as_ref().and_then(shell_pid).and_then(shell_identity);
     // Liveness evidence for `classify_idle`: the pane's agent is running
@@ -593,6 +678,12 @@ fn poll_once(pane_id: &str, config: &Config, st: &mut MonitorState) -> bool {
                 &config.commands,
             )
             .is_some_and(|s| !s.value.is_empty());
+            let (profile, default) = if agent == "claude" {
+                resume_profile(&pane)
+            } else {
+                (None, None)
+            };
+            let argv = with_claude_profile(&agent, argv, profile.as_deref(), default.as_deref());
             let args: Vec<&str> = argv.iter().map(String::as_str).collect();
             if herdr::pane_run(pane_id, &args) {
                 st.cooldown_until =
@@ -828,6 +919,50 @@ mod tests {
         ]});
         assert!(!foreground_runs(&vim, "claude"));
         assert!(!foreground_runs(&serde_json::json!({}), "claude"));
+    }
+
+    #[test]
+    fn claude_pid_finds_live_claude_entry() {
+        // Live claude shape (herdr 0.9.5): `name` + `pid`, no argv.
+        let info = serde_json::json!({"foreground_processes": [
+            {"cwd": "/home/joseph", "name": "claude", "pid": 17572},
+            {"argv": ["agentmail", "mcp"], "name": "agentmail", "pid": 17600}
+        ]});
+        assert_eq!(claude_pid(&info), Some(17572));
+        let argv_only = serde_json::json!({"foreground_processes": [
+            {"argv": ["/home/joseph/.local/bin/claude", "--resume", "x"], "pid": 9}
+        ]});
+        assert_eq!(claude_pid(&argv_only), Some(9));
+        let other = serde_json::json!({"foreground_processes": [
+            {"argv": ["vim"], "name": "vim", "pid": 3}
+        ]});
+        assert_eq!(claude_pid(&other), None);
+    }
+
+    #[test]
+    fn with_claude_profile_flags_only_non_default_profiles() {
+        let argv = || vec!["claude".to_string(), "--resume".into(), "s1".into()];
+        assert_eq!(
+            with_claude_profile("claude", argv(), Some("personal"), Some("work")),
+            vec!["claude", "--profile", "personal", "--resume", "s1"]
+        );
+        assert_eq!(
+            with_claude_profile("claude", argv(), Some("work"), Some("work")),
+            argv(),
+            "default profile: plain resume"
+        );
+        assert_eq!(with_claude_profile("claude", argv(), None, Some("work")), argv());
+        assert_eq!(
+            with_claude_profile("claude", argv(), Some("personal"), None),
+            vec!["claude", "--profile", "personal", "--resume", "s1"],
+            "no default set: any profile is explicit"
+        );
+        let kiro = vec!["kiro-cli".to_string(), "chat".into()];
+        assert_eq!(
+            with_claude_profile("kiro", kiro.clone(), Some("personal"), Some("work")),
+            kiro,
+            "only claude takes --profile"
+        );
     }
 
     #[test]
@@ -1337,6 +1472,162 @@ mod tests {
             assert!(poll_once("wAA:p1", &config, &mut fresh));
             assert_eq!(pane_runs(dir), 0, "calls: {}", herdr_calls(dir));
         });
+    }
+
+    /// claude-profile install under `xdg`: `work` (default) and
+    /// `personal`; returns the data dir.
+    fn claude_profiles(xdg: &std::path::Path) -> std::path::PathBuf {
+        let data = xdg.join("claude-profiles");
+        for p in ["work", "personal"] {
+            std::fs::create_dir_all(data.join(p).join("sessions")).expect("profile");
+        }
+        std::fs::write(data.join(".default"), "work").expect("default");
+        data
+    }
+
+    /// A stand-in Claude process running under `config` (its environ is
+    /// what the monitor reads), with `sessions/<pid>.json` naming `sid`.
+    fn fake_claude(config: &std::path::Path, sid: &str) -> std::process::Child {
+        let child = std::process::Command::new("sleep")
+            .arg("60")
+            .env("CLAUDE_CONFIG_DIR", config)
+            .spawn()
+            .expect("spawn fake claude");
+        let pid = child.id();
+        std::fs::write(
+            config.join(format!("sessions/{pid}.json")),
+            format!(r#"{{"pid":{pid},"sessionId":"{sid}"}}"#),
+        )
+        .expect("session file");
+        for _ in 0..200 {
+            if crate::claude_profile::config_dir_of(pid).as_deref() == Some(config) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        child
+    }
+
+    /// Stage one poll of claude pane `w2A:p1` (cwd `cwd`, no herdr
+    /// `agent_session`) whose shell is `shell`, foreground `fg`.
+    fn stage_claude(
+        dir: &std::path::Path,
+        cwd: &std::path::Path,
+        shell: u32,
+        fg: serde_json::Value,
+    ) {
+        let get = serde_json::json!({"id": "cli:pane:get", "result": {"pane": {
+            "pane_id": "w2A:p1", "agent": "claude", "agent_status": "working",
+            "cwd": cwd}}});
+        std::fs::write(dir.join("get.json"), get.to_string()).expect("stage get");
+        let info = serde_json::json!({"id": "cli:pane:process-info", "result": {
+            "process_info": {"shell_pid": shell, "foreground_processes": fg}}});
+        std::fs::write(dir.join("info.json"), info.to_string()).expect("stage info");
+    }
+
+    fn idle_zsh() -> serde_json::Value {
+        serde_json::json!([{"argv": ["/usr/bin/zsh"], "name": "zsh"}])
+    }
+
+    /// Live claude (agent session invisible to herdr) under `profile`,
+    /// then a host restart; returns the relaunch line typed.
+    fn claude_restart_relaunch(profile: &str) -> String {
+        let xdg = crate::test_support::unique_temp_dir("xdg");
+        let data = claude_profiles(&xdg);
+        let xdg_s = xdg.to_string_lossy().into_owned();
+        let mut line = String::new();
+        run_with_fake_herdr(STAGED_SCRIPT, &[("XDG_DATA_HOME", Some(&xdg_s))], |dir| {
+            let mut claude = fake_claude(&data.join(profile), "sess-p-1");
+            let config = Config::default();
+            let mut st = MonitorState::default();
+            stage_claude(
+                dir,
+                &xdg,
+                std::os::unix::process::parent_id(),
+                serde_json::json!([{"name": "claude", "pid": claude.id()}]),
+            );
+            assert!(poll_once("w2A:p1", &config, &mut st)); // live
+            claude.kill().ok();
+            claude.wait().ok();
+            assert_eq!(
+                crate::state::load_registry().get("w2A:p1").map(|s| s.value.clone()),
+                Some("sess-p-1".to_string()),
+                "session captured from {profile}/sessions/<pid>.json"
+            );
+            assert_eq!(crate::state::profile_for("w2A:p1").as_deref(), Some(profile));
+            stage_claude(dir, &xdg, std::process::id(), idle_zsh());
+            assert!(poll_once("w2A:p1", &config, &mut st)); // host restarted
+            line = herdr_calls(dir)
+                .lines()
+                .find(|l| l.contains("pane run"))
+                .unwrap_or_default()
+                .to_string();
+        });
+        std::fs::remove_dir_all(&xdg).ok();
+        line
+    }
+
+    #[test]
+    fn poll_once_resumes_non_default_claude_profile() {
+        assert_eq!(
+            claude_restart_relaunch("personal"),
+            "4:pane run w2A:p1 claude --profile personal --resume sess-p-1"
+        );
+    }
+
+    #[test]
+    fn poll_once_resumes_default_claude_profile_plainly() {
+        assert_eq!(
+            claude_restart_relaunch("work"),
+            "4:pane run w2A:p1 claude --resume sess-p-1"
+        );
+    }
+
+    /// Never seen live (no recorded profile): a host restart of a pane
+    /// whose cwd holds `.claude-profile` = personal; returns the
+    /// relaunch line. `installed` = claude-profile data dir present.
+    fn dotfile_restart_relaunch(installed: bool) -> String {
+        let xdg = crate::test_support::unique_temp_dir("xdg");
+        if installed {
+            claude_profiles(&xdg);
+        }
+        let proj = xdg.join("proj/sub");
+        std::fs::create_dir_all(&proj).expect("proj");
+        std::fs::write(xdg.join("proj/.claude-profile"), "personal\n").expect("dotfile");
+        let xdg_s = xdg.to_string_lossy().into_owned();
+        let mut line = String::new();
+        run_with_fake_herdr(STAGED_SCRIPT, &[("XDG_DATA_HOME", Some(&xdg_s))], |dir| {
+            crate::state::remember(
+                "w2A:p1",
+                SessionRef { agent: "claude".into(), value: "sess-d-1".into() },
+            );
+            seed_host_restart("w2A:p1");
+            stage_claude(dir, &proj, std::process::id(), idle_zsh());
+            assert!(poll_once("w2A:p1", &Config::default(), &mut MonitorState::default()));
+            line = herdr_calls(dir)
+                .lines()
+                .find(|l| l.contains("pane run"))
+                .unwrap_or_default()
+                .to_string();
+        });
+        std::fs::remove_dir_all(&xdg).ok();
+        line
+    }
+
+    #[test]
+    fn poll_once_falls_back_to_local_claude_profile_file() {
+        assert_eq!(
+            dotfile_restart_relaunch(true),
+            "4:pane run w2A:p1 claude --profile personal --resume sess-d-1"
+        );
+    }
+
+    #[test]
+    fn poll_once_ignores_profiles_without_claude_profile_installed() {
+        assert_eq!(
+            dotfile_restart_relaunch(false),
+            "4:pane run w2A:p1 claude --resume sess-d-1"
+        );
     }
 
     #[test]
