@@ -71,7 +71,7 @@ fn parse_panes(raw: &str) -> Vec<Pane> {
 /// Pipes are drained concurrently by reader threads so a child that fills
 /// stdout/stderr cannot deadlock against the `try_wait` poll loop.
 fn run_raw(args: &[&str]) -> Result<std::process::Output, String> {
-    let bin = std::env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".to_string());
+    let bin = crate::config::env_string("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".to_string());
     let mut child = std::process::Command::new(&bin)
         .args(args)
         .stdout(std::process::Stdio::piped())
@@ -517,16 +517,12 @@ mod tests {
     #[test]
     fn invoke_returns_none_on_spawn_failure() {
         let _guard = lock_env();
-        let prev = std::env::var_os("HERDR_BIN_PATH");
+        let _restore = crate::test_support::EnvRestore::capture(["HERDR_BIN_PATH"]);
         std::env::set_var(
             "HERDR_BIN_PATH",
             "/nonexistent-herdr-bin-xyz-12345/herdr",
         );
         let result = invoke(&["pane", "list"]);
-        match prev {
-            Some(v) => std::env::set_var("HERDR_BIN_PATH", v),
-            None => std::env::remove_var("HERDR_BIN_PATH"),
-        }
         assert_eq!(result, None);
     }
 
@@ -738,13 +734,9 @@ mod tests {
     #[test]
     fn pane_run_false_on_spawn_failure() {
         let _guard = lock_env();
-        let prev = std::env::var_os("HERDR_BIN_PATH");
+        let _restore = crate::test_support::EnvRestore::capture(["HERDR_BIN_PATH"]);
         std::env::set_var("HERDR_BIN_PATH", "/nonexistent-herdr-bin-xyz-12345/herdr");
         let result = pane_run("w1:p1", &["echo", "hi"]);
-        match prev {
-            Some(v) => std::env::set_var("HERDR_BIN_PATH", v),
-            None => std::env::remove_var("HERDR_BIN_PATH"),
-        }
         assert!(!result);
     }
 
@@ -763,13 +755,9 @@ mod tests {
     #[test]
     fn pane_list_checked_none_on_spawn_failure() {
         let _guard = lock_env();
-        let prev = std::env::var_os("HERDR_BIN_PATH");
+        let _restore = crate::test_support::EnvRestore::capture(["HERDR_BIN_PATH"]);
         std::env::set_var("HERDR_BIN_PATH", "/nonexistent-herdr-bin-xyz-12345/herdr");
         let result = pane_list_checked();
-        match prev {
-            Some(v) => std::env::set_var("HERDR_BIN_PATH", v),
-            None => std::env::remove_var("HERDR_BIN_PATH"),
-        }
         assert_eq!(result, None);
     }
 
