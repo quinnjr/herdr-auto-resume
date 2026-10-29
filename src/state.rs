@@ -173,6 +173,41 @@ pub fn record_shell(pane_id: &str, record: ShellRecord) {
     std::fs::rename(&tmp, shells_path()).ok();
 }
 
+fn profiles_path() -> PathBuf {
+    config::state_dir().join("profiles.json")
+}
+
+fn load_profiles() -> HashMap<String, String> {
+    std::fs::read_to_string(profiles_path())
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+/// The claude-profile a pane's Claude was last seen running under.
+pub fn profile_for(pane_id: &str) -> Option<String> {
+    load_profiles().remove(pane_id)
+}
+
+/// Record the pane's live claude-profile, atomically via
+/// `profiles.json.tmp` + rename. Skips the write when unchanged
+/// (monitors call this every poll while Claude is alive).
+pub fn record_profile(pane_id: &str, profile: &str) {
+    let mut profiles = load_profiles();
+    if profiles.get(pane_id).map(String::as_str) == Some(profile) {
+        return;
+    }
+    profiles.insert(pane_id.to_string(), profile.to_string());
+    let dir = config::state_dir();
+    std::fs::create_dir_all(&dir).ok();
+    let text = serde_json::to_string(&profiles).unwrap_or_else(|_| "{}".to_string());
+    let tmp = dir.join("profiles.json.tmp");
+    if std::fs::write(&tmp, text).is_err() {
+        return;
+    }
+    std::fs::rename(&tmp, profiles_path()).ok();
+}
+
 /// Legacy lock-file path (`:` -> `_`), kept for migration from the
 /// pre-encoding layout. New code writes via [`monitor_lock_path`]; reads
 /// fall back here when the new path is absent.
@@ -647,6 +682,21 @@ mod tests {
             assert!(!reg.contains_key("w7G:p1"));
             assert_eq!(reg["w7G:p2"].value, "sess-2");
             assert!(dir.join("registry.json").exists());
+        });
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn profiles_round_trip_per_pane() {
+        let dir = with_temp_state_dir(|dir| {
+            assert_eq!(profile_for("w7G:p1"), None);
+            record_profile("w7G:p1", "personal");
+            record_profile("w7G:p2", "work");
+            record_profile("w7G:p1", "work");
+            assert_eq!(profile_for("w7G:p1").as_deref(), Some("work"), "overwrite");
+            assert_eq!(profile_for("w7G:p2").as_deref(), Some("work"));
+            std::fs::write(dir.join("profiles.json"), "not json").expect("corrupt");
+            assert_eq!(profile_for("w7G:p1"), None, "corrupt file reads as empty");
         });
         std::fs::remove_dir_all(&dir).ok();
     }

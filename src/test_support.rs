@@ -50,7 +50,8 @@ pub(crate) fn herdr_calls(state_dir: &std::path::Path) -> String {
 /// `HERDR_PLUGIN_CONFIG_DIR` and `HERDR_PLUGIN_STATE_DIR`. The calls log
 /// lives at `base/state/calls.log` (the `state_dir` handed to `f`).
 /// Applies `extra_env` (`Some` = set, `None` = remove), runs `f(&state_dir`),
-/// then restores BIN+CONFIG+STATE+PANE_ID+EVENT_JSON and removes the base
+/// then restores BIN+CONFIG+STATE+PANE_ID+EVENT_JSON plus every `extra_env`
+/// key and removes the base
 /// dir. Serialized on the crate-wide env lock; asserts the closure did not
 /// panic.
 pub(crate) fn run_with_fake_herdr(
@@ -79,6 +80,10 @@ pub(crate) fn run_with_fake_herdr(
     std::env::set_var("HERDR_BIN_PATH", &bin);
     std::env::set_var("HERDR_PLUGIN_CONFIG_DIR", &state_dir);
     std::env::set_var("HERDR_PLUGIN_STATE_DIR", &state_dir);
+    let prev_extra: Vec<_> = extra_env
+        .iter()
+        .map(|(k, _)| (*k, std::env::var_os(k)))
+        .collect();
     for (k, v) in extra_env {
         match v {
             Some(s) => std::env::set_var(k, s),
@@ -105,6 +110,12 @@ pub(crate) fn run_with_fake_herdr(
     match prev_event {
         Some(v) => std::env::set_var("HERDR_PLUGIN_EVENT_JSON", v),
         None => std::env::remove_var("HERDR_PLUGIN_EVENT_JSON"),
+    }
+    for (k, v) in prev_extra {
+        match v {
+            Some(v) => std::env::set_var(k, v),
+            None => std::env::remove_var(k),
+        }
     }
     std::fs::remove_dir_all(&base).ok();
     assert!(r.is_ok());

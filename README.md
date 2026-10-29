@@ -110,6 +110,28 @@ spawns (`supervise-all`, `hook-pane`) or stop sentinel writes (`stop`)
 fail — the failure count is printed; `2` for usage errors (unknown
 command, `monitor` without a pane id).
 
+## claude-profile
+
+When [claude-profile](https://github.com/quinnjr/claude-code-profiles) is
+installed (`$XDG_DATA_HOME/claude-profiles`, else
+`~/.local/share/claude-profiles`), Claude panes resume under the profile
+they ran in:
+
+- While Claude runs, the monitor reads its `CLAUDE_CONFIG_DIR` from
+  `/proc/<pid>/environ` and records which profile it is. Herdr only sees
+  the sessions of the config dir it was started with (normally the default
+  profile), so for other profiles the session id is read from
+  `<profile>/sessions/<pid>.json` instead.
+- On a host restart, a non-default profile resumes as
+  `claude --profile <name> --resume <id>`. This uses the `claude` wrapper's
+  own flag, typed into the pane's shell, so the wrapper must be loaded
+  there. The default profile resumes as plain `claude --resume <id>`.
+- If the pane was never seen running, the nearest `.claude-profile`
+  from the pane's cwd upwards names the profile.
+
+Claude running under a config dir that is not a managed profile gets no
+session capture: a resume could not reach its sessions.
+
 ## config.json reference
 
 Location: `herdr plugin config-dir quinnjr.auto-resume`
@@ -156,7 +178,7 @@ or invalid JSON → defaults.
 
 Under the plugin config/state dir: `registry.json` (pane → session),
 `shells.json` (pane → shell the agent was last seen in, and whether it
-is still live), `monitors/<pane>.json` (monitor locks, `:` → `_`), `stop-<pid>`
+is still live), `profiles.json` (pane → claude-profile it ran under), `monitors/<pane>.json` (monitor locks, `:` → `_`), `stop-<pid>`
 sentinels, `log.txt`. Override dir with `HERDR_PLUGIN_CONFIG_DIR`
 (tests, dev) or `HERDR_BIN_PATH` (fake `herdr` binary).
 

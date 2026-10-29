@@ -1,3 +1,4 @@
+mod claude_profile;
 mod config;
 mod herdr;
 mod kiro;
