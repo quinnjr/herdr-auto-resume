@@ -230,7 +230,8 @@ needs no claude-profile):
   flag it expands to. Both answers are recorded, so a later plain
   `claude` in the same pane clears it.
 - With several claude processes in the pane's foreground, the flag is
-  remembered only when every one whose argv is known carries it: a
+  remembered only when every one of them has a known argv carrying it,
+  and any known plain one records a plain run: a
   `claude -p --dangerously-skip-permissions` child of a plain session
   never lends it the flag.
 - On a host restart, a pane last seen with the flag resumes as
@@ -244,7 +245,11 @@ needs no claude-profile):
   template (`env FOO=1 claude ...`) the agent's program is not `claude`,
   so nothing is recorded and the flag is never added (put it in the
   template instead). A flag recorded under an earlier direct template is
-  not applied either, and the relaunch logs a warning.
+  not applied either (the `claude` agent logs a warning on that
+  relaunch; an aliased key drops it silently).
+- A Claude build that retitles its process (cmdline reduced to a bare
+  `claude`) is read from herdr's reported argv instead; with neither
+  showing the flag it is taken as a plain run.
 
 ## config.json reference
 

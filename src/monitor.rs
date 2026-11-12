@@ -752,31 +752,57 @@ fn maybe_capture_claude(
 /// Both answers are recorded: a later plain run clears an earlier skip.
 ///
 /// Each claude entry's argv is the process's own (`/proc/<pid>/cmdline`:
-/// herdr reports claude name-only), else the one herdr reported; an
-/// entry with neither says nothing. Fail closed across entries: the
-/// pane skips only when EVERY claude process whose argv is known
-/// carries the flag, so a `claude -p --dangerously-skip-permissions`
-/// child of a plain session never lends it the flag (whichever pid is
-/// lower). With no known argv at all the last answer stands.
+/// herdr reports claude name-only), else the one herdr reported
+/// ([`claude_entry_argv`]); an entry with neither is unknown. Fail
+/// closed across entries: any known plain claude records a plain run,
+/// and a skip is recorded only when EVERY claude entry is known and
+/// carries the flag and no entry was dropped as unparseable — so a
+/// `claude -p --dangerously-skip-permissions` child never lends a plain
+/// (or unreadable) session the flag. Otherwise the last answer stands.
 fn maybe_capture_claude_permissions(pane: &Pane, program: Option<&str>, procs: &[ProcEntry]) {
     let Some(program) = program.filter(|p| *p == "claude") else {
         return;
     };
-    let mut known = procs
+    let claudes: Vec<Option<bool>> = procs
         .iter()
         .filter(|e| entry_runs(e, program))
-        .filter_map(|e| {
-            e.pid
-                .and_then(crate::claude_profile::argv_of)
-                .or_else(|| (!e.name_only).then(|| e.argv.clone()))
+        .map(|e| {
+            claude_entry_argv(e).map(|argv| crate::claude_profile::argv_skips_permissions(&argv))
         })
-        .map(|argv| crate::claude_profile::argv_skips_permissions(&argv))
-        .peekable();
-    if known.peek().is_none() {
+        .collect();
+    let poisoned = procs
+        .iter()
+        .any(|e| e.argv.iter().any(|t| t == UNPARSEABLE));
+    let skip = if claudes.contains(&Some(false)) {
+        false
+    } else if !claudes.is_empty() && !poisoned && claudes.iter().all(|c| *c == Some(true)) {
+        true
+    } else {
         return;
-    }
-    let skip = known.all(|skips| skips);
+    };
     crate::state::record_skip_permissions(&pane.pane_id, skip);
+}
+
+/// The argv a claude entry was started with, when known: the process's
+/// own cmdline, else the one herdr reported (never a name-only entry's
+/// synthesized `[name]`); see [`known_argv`].
+fn claude_entry_argv(entry: &ProcEntry) -> Option<Vec<String>> {
+    known_argv(
+        entry.pid.and_then(crate::claude_profile::argv_of),
+        (!entry.name_only).then(|| entry.argv.clone()),
+    )
+}
+
+/// `own` (a process's cmdline) over `reported` (herdr's argv for it),
+/// except that a one-token cmdline yields to a longer reported argv: a
+/// runtime that retitles itself (node's `process.title`) overwrites its
+/// cmdline with the bare title.
+fn known_argv(own: Option<Vec<String>>, reported: Option<Vec<String>>) -> Option<Vec<String>> {
+    match (own, reported) {
+        (Some(own), Some(reported)) if own.len() == 1 && reported.len() > 1 => Some(reported),
+        (Some(own), _) => Some(own),
+        (None, reported) => reported,
+    }
 }
 
 /// `claude --dangerously-skip-permissions ...` when the pane's Claude
@@ -3500,12 +3526,46 @@ mod tests {
                     {"argv": flagged, "name": "claude", "pid": child_pid}
                 ])));
             }
-            // All known carry it; a name-only entry says nothing.
             assert!(capture(serde_json::json!([
                 {"argv": flagged, "name": "claude"},
-                {"name": "claude"}
+                {"argv": ["claude", "--dangerously-skip-permissions"], "name": "claude"}
             ])));
+            // An unknown claude (name-only) or a dropped entry beside a
+            // flagged one is no evidence either way: the answer stands,
+            // from `false` as from `true`.
+            let unknown = serde_json::json!([
+                {"argv": flagged, "name": "claude"},
+                {"name": "claude"}
+            ]);
+            let dropped = serde_json::json!([{"argv": flagged, "name": "claude"}, 42]);
+            assert!(capture(unknown.clone()));
+            assert!(capture(dropped.clone()));
+            assert!(!capture(serde_json::json!([{"argv": ["claude"], "name": "claude"}])));
+            assert!(!capture(unknown));
+            assert!(!capture(dropped));
         });
+    }
+
+    #[test]
+    fn known_argv_prefers_cmdline_unless_retitled() {
+        let argv = |s: &str| Some(crate::resume::split_argv(s));
+        let flagged = || argv("claude --dangerously-skip-permissions");
+        assert_eq!(known_argv(argv("claude -c"), flagged()), argv("claude -c"));
+        assert_eq!(known_argv(argv("claude -c"), None), argv("claude -c"));
+        assert_eq!(known_argv(None, flagged()), flagged());
+        assert_eq!(known_argv(None, None), None);
+        // A one-token cmdline (a retitled runtime) yields to a longer
+        // report, but not to an equally bare one.
+        assert_eq!(known_argv(argv("claude"), flagged()), flagged());
+        assert_eq!(known_argv(argv("claude"), argv("node")), argv("claude"));
+        // A name-only entry's synthesized argv is never the report.
+        let name_only = ProcEntry {
+            name: Some("claude".into()),
+            argv: vec!["claude".into()],
+            pid: None,
+            name_only: true,
+        };
+        assert_eq!(claude_entry_argv(&name_only), None);
     }
 
     #[test]
@@ -3545,6 +3605,17 @@ mod tests {
                 claude.wait().ok();
                 assert_eq!(crate::state::skip_permissions_for("w2A:p1"), expected);
             }
+            // The process's own cmdline outranks a disagreeing report.
+            assert!(crate::state::record_skip_permissions("w2A:p1", true));
+            let mut claude = spawn(&[]);
+            let entries = foreground_entries(&serde_json::json!({"foreground_processes": [
+                {"argv": ["claude", "--dangerously-skip-permissions"], "name": "claude",
+                 "pid": claude.id()}
+            ]}));
+            maybe_capture_claude_permissions(&pane, Some("claude"), &entries);
+            claude.kill().ok();
+            claude.wait().ok();
+            assert!(!crate::state::skip_permissions_for("w2A:p1"));
         });
     }
 
