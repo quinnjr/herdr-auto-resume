@@ -804,6 +804,38 @@ pub fn record_profile(pane_id: &str, profile: &str) -> bool {
     )
 }
 
+fn permissions_path() -> PathBuf {
+    config::state_dir().join("permissions.json")
+}
+
+fn load_permissions() -> HashMap<String, bool> {
+    load_tolerant_map(&permissions_path(), "load_permissions")
+}
+
+/// Whether a pane's Claude was last seen running with
+/// `--dangerously-skip-permissions`. False when never recorded (or the
+/// file is unreadable): a relaunch never skips permissions without
+/// evidence.
+pub fn skip_permissions_for(pane_id: &str) -> bool {
+    load_permissions().remove(pane_id).unwrap_or(false)
+}
+
+/// Record whether the pane's live Claude skips permissions (both
+/// answers: a later plain run clears an earlier `true`), like
+/// [`record_profile`]. True on persist or no-op; false on write failure
+/// (logged).
+pub fn record_skip_permissions(pane_id: &str, skip: bool) -> bool {
+    upsert_locked(
+        &permissions_path(),
+        pane_id,
+        skip,
+        load_permissions().get(pane_id),
+        STATE_LOCK_WAIT,
+        || read_map_file(&permissions_path(), "record_skip_permissions"),
+        "record_skip_permissions",
+    )
+}
+
 /// Pane ids accepted for lock-file handling: nonempty, at most 128
 /// bytes, ASCII alphanumeric plus `:`, `_`, `-`. Anything else fails
 /// closed (callers return `None`/`false` and log).
@@ -1471,6 +1503,25 @@ mod tests {
             assert_eq!(profile_for("w7G:p2").as_deref(), Some("work"));
             std::fs::write(dir.join("profiles.json"), "not json").expect("corrupt");
             assert_eq!(profile_for("w7G:p1"), None, "corrupt file reads as empty");
+        });
+    }
+
+    #[test]
+    fn skip_permissions_round_trip_per_pane() {
+        with_temp_state_dir(|dir| {
+            assert!(!skip_permissions_for("w7G:p1"), "unrecorded: never skip");
+            assert!(record_skip_permissions("w7G:p1", true));
+            assert!(record_skip_permissions("w7G:p2", false));
+            assert!(skip_permissions_for("w7G:p1"));
+            assert!(!skip_permissions_for("w7G:p2"));
+            assert!(record_skip_permissions("w7G:p1", false));
+            assert!(!skip_permissions_for("w7G:p1"), "a plain run clears it");
+            assert!(record_skip_permissions("w7G:p2", true));
+            std::fs::write(dir.join("permissions.json"), "not json").expect("corrupt");
+            assert!(
+                !skip_permissions_for("w7G:p2"),
+                "corrupt file reads as empty"
+            );
         });
     }
 
