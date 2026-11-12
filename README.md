@@ -229,14 +229,22 @@ needs no claude-profile):
   alias (e.g. `claude --yolo`) counts: the process argv carries the real
   flag it expands to. Both answers are recorded, so a later plain
   `claude` in the same pane clears it.
+- With several claude processes in the pane's foreground, the flag is
+  remembered only when every one whose argv is known carries it: a
+  `claude -p --dangerously-skip-permissions` child of a plain session
+  never lends it the flag.
 - On a host restart, a pane last seen with the flag resumes as
   `claude --dangerously-skip-permissions --resume <id>` (right after
   argv[0], behind a `--profile <name>` when both apply; not doubled when
-  the template already carries it). As with profiles, a launcher
-  template (`env FOO=1 claude ...`) relaunches without it and logs a
-  warning.
-- A pane never seen running Claude, or whose argv could not be read (no
-  procfs, e.g. macOS), resumes without the flag.
+  the template already carries it).
+- A pane never seen running Claude, or whose claude argv was never known
+  (no `/proc/<pid>/cmdline`, e.g. macOS, and herdr reporting the name
+  only), resumes without the flag.
+- Like profiles, this needs a direct-binary template. Under a launcher
+  template (`env FOO=1 claude ...`) the agent's program is not `claude`,
+  so nothing is recorded and the flag is never added (put it in the
+  template instead). A flag recorded under an earlier direct template is
+  not applied either, and the relaunch logs a warning.
 
 ## config.json reference
 
