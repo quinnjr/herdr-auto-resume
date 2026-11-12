@@ -217,6 +217,27 @@ they ran in (any agent whose template runs `claude`, e.g. an aliased
 Claude running under a config dir that is not a managed profile gets no
 session capture: a resume could not reach its sessions.
 
+## Claude permission mode
+
+A Claude pane started with `--dangerously-skip-permissions` resumes with
+it (any agent whose template runs `claude` is treated the same; this
+needs no claude-profile):
+
+- While Claude runs, the monitor reads its argv (`/proc/<pid>/cmdline`,
+  since herdr reports claude by name only; else the argv herdr reports)
+  and records per pane whether the flag is there. A shell wrapper's
+  alias (e.g. `claude --yolo`) counts: the process argv carries the real
+  flag it expands to. Both answers are recorded, so a later plain
+  `claude` in the same pane clears it.
+- On a host restart, a pane last seen with the flag resumes as
+  `claude --dangerously-skip-permissions --resume <id>` (right after
+  argv[0], behind a `--profile <name>` when both apply; not doubled when
+  the template already carries it). As with profiles, a launcher
+  template (`env FOO=1 claude ...`) relaunches without it and logs a
+  warning.
+- A pane never seen running Claude, or whose argv could not be read (no
+  procfs, e.g. macOS), resumes without the flag.
+
 ## config.json reference
 
 Location: `herdr plugin config-dir quinnjr.auto-resume`
@@ -297,6 +318,8 @@ Under the plugin state dir: `registry.json` (pane → session),
 `shells.json` (pane → shell the agent was last seen in, whether it
 is still live, and the agent process last seen there with its session
 flag, if any), `profiles.json` (pane → claude-profile it ran under),
+`permissions.json` (pane → whether its Claude ran with
+`--dangerously-skip-permissions`),
 `monitors/<pane>.json` (monitor locks; the pane id is encoded
 injectively: `_` → `__u__`, `:` → `__c__`, any other byte outside
 `[A-Za-z0-9-]` → `__xHH__`, so `w7G:p1` → `w7G__c__p1.json`; only
@@ -307,7 +330,7 @@ one generation kept; the rotation is serialized under `state.lock`
 with the size re-checked, so racing monitors rotate once; it never
 waits for the lock: while another process holds it rotation is skipped
 until a later append), and
-`state.lock` (an exclusive lock serializing the registry/shells/profiles
+`state.lock` (an exclusive lock serializing the registry/shells/profiles/permissions
 load-modify-save across monitor processes; an unchanged write is
 decided on an unlocked read and skips the lock; writes stage through
 a unique `<name>.stage-<pid>.<n>.tmp` + rename, `n` a per-process counter, so

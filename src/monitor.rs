@@ -739,6 +739,52 @@ fn maybe_capture_claude(
     Some(sess)
 }
 
+/// Permission-mode capture: while the pane's agent runs claude (same
+/// gate as [`maybe_capture_claude`], without needing claude-profile),
+/// remember whether its process ([`claude_pid`]'s) was started with
+/// `--dangerously-skip-permissions`, so the relaunch keeps the mode.
+/// Both answers are recorded: a later plain run clears an earlier skip.
+///
+/// The argv is the process's own (`/proc/<pid>/cmdline`: herdr reports
+/// claude name-only), else the one herdr reported. A name-only entry
+/// whose cmdline is unreadable says nothing, so the last answer stands.
+fn maybe_capture_claude_permissions(pane: &Pane, program: Option<&str>, procs: &[ProcEntry]) {
+    let Some(program) = program.filter(|p| *p == "claude") else {
+        return;
+    };
+    let Some(entry) = procs
+        .iter()
+        .filter(|e| entry_runs(e, program))
+        .min_by_key(|e| (e.pid.is_none(), e.pid))
+    else {
+        return;
+    };
+    let name_only = entry.argv.len() == 1 && entry.name.as_deref() == Some(&entry.argv[0]);
+    let skip = match entry.pid.and_then(crate::claude_profile::argv_of) {
+        Some(argv) => crate::claude_profile::argv_skips_permissions(&argv),
+        None if name_only => return,
+        None => crate::claude_profile::argv_skips_permissions(&entry.argv),
+    };
+    crate::state::record_skip_permissions(&pane.pane_id, skip);
+}
+
+/// `claude --dangerously-skip-permissions ...` when the pane's Claude
+/// was last seen running with it (the flag goes right after argv[0]);
+/// otherwise — or when the template already carries it — the argv
+/// unchanged. Like [`with_claude_profile`], only a template whose
+/// `program` is `claude` takes the flag; the flag is `false` when it
+/// was needed but could not be applied (the caller logs a warning).
+fn with_skip_permissions(program: &str, mut argv: Vec<String>, skip: bool) -> (Vec<String>, bool) {
+    if !skip || crate::claude_profile::argv_skips_permissions(&argv) {
+        return (argv, true);
+    }
+    if program != "claude" {
+        return (argv, false);
+    }
+    argv.insert(1, crate::claude_profile::SKIP_PERMISSIONS_FLAG.to_string());
+    (argv, true)
+}
+
 /// Whether a relaunch resumes under a claude-profile: the `claude`
 /// agent, or any agent whose template `program` (the
 /// [`PollAction::Relaunch`] one, argv[0]'s basename) is `claude` (an
@@ -994,6 +1040,7 @@ fn poll_once(pane_id: &str, config: &Config, st: &mut MonitorState) -> bool {
     ) {
         pane.agent_session.get_or_insert(sess);
     }
+    maybe_capture_claude_permissions(&pane, program.as_deref(), &procs);
     let shell = info.as_ref().and_then(shell_pid).and_then(shell_identity);
     // Liveness evidence for `classify_idle`: the pane's agent is running
     // under this shell right now. Positive program match only — a stale
@@ -1114,6 +1161,17 @@ fn poll_once(pane_id: &str, config: &Config, st: &mut MonitorState) -> bool {
             } else {
                 (None, None)
             };
+            // The permission mode first, so a profile lands ahead of it
+            // (`claude --profile <name> --dangerously-skip-permissions ...`).
+            let skip = claude_profile_applies(&agent, &program)
+                && crate::state::skip_permissions_for(pane_id);
+            let (argv, skip_applied) = with_skip_permissions(&program, argv, skip);
+            if !skip_applied {
+                crate::state::append_log(&format!(
+                    "monitor {pane_id}: WARNING resume command does not start with `claude` (use a direct-binary template); relaunching without {}",
+                    crate::claude_profile::SKIP_PERMISSIONS_FLAG
+                ));
+            }
             let (argv, applied) =
                 with_claude_profile(&program, argv, profile.as_deref(), default.as_deref());
             if !applied {
@@ -3091,8 +3149,21 @@ mod tests {
     /// A stand-in Claude process running under `config` (its environ is
     /// what the monitor reads), with `sessions/<pid>.json` naming `sid`.
     fn fake_claude(config: &std::path::Path, sid: &str) -> std::process::Child {
-        let child = std::process::Command::new("sleep")
-            .arg("60")
+        fake_claude_with(config, sid, &[])
+    }
+
+    /// [`fake_claude`] started with `flags` (its cmdline is what the
+    /// monitor reads): a shell blocked on its piped stdin, the flags
+    /// riding along as positional parameters.
+    fn fake_claude_with(
+        config: &std::path::Path,
+        sid: &str,
+        flags: &[&str],
+    ) -> std::process::Child {
+        let child = std::process::Command::new("sh")
+            .args(["-c", "read _", "claude"])
+            .args(flags)
+            .stdin(std::process::Stdio::piped())
             .env("CLAUDE_CONFIG_DIR", config)
             .spawn()
             .expect("spawn fake claude");
@@ -3102,8 +3173,11 @@ mod tests {
             format!(r#"{{"pid":{pid},"sessionId":"{sid}"}}"#),
         )
         .expect("session file");
+        // The environ and cmdline of a just-forked child can still be ours.
         for _ in 0..200 {
-            if crate::claude_profile::config_dir_of(pid).as_deref() == Some(config) {
+            if crate::claude_profile::config_dir_of(pid).as_deref() == Some(config)
+                && crate::claude_profile::argv_of(pid).is_some_and(|a| a[0] == "sh")
+            {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -3146,17 +3220,23 @@ mod tests {
     /// Live claude (agent session invisible to herdr) under `profile`,
     /// then a host restart; returns the relaunch line typed.
     fn claude_restart_relaunch(profile: &str) -> String {
-        claude_restart_relaunch_as(profile, "claude", Config::default())
+        claude_restart_relaunch_as(profile, "claude", Config::default(), &[])
     }
 
-    /// [`claude_restart_relaunch`] for a pane labelled `agent`.
-    fn claude_restart_relaunch_as(profile: &str, agent: &str, config: Config) -> String {
+    /// [`claude_restart_relaunch`] for a pane labelled `agent`, its
+    /// Claude started with `flags`.
+    fn claude_restart_relaunch_as(
+        profile: &str,
+        agent: &str,
+        config: Config,
+        flags: &[&str],
+    ) -> String {
         let xdg = crate::test_support::unique_temp_dir("xdg");
         let data = claude_profiles(&xdg);
         let xdg_s = xdg.to_string_lossy().into_owned();
         let mut line = String::new();
         run_with_fake_herdr(STAGED_SCRIPT, &[("XDG_DATA_HOME", Some(&xdg_s))], |dir| {
-            let mut claude = fake_claude(&data.join(profile), "sess-p-1");
+            let mut claude = fake_claude_with(&data.join(profile), "sess-p-1", flags);
             let mut st = MonitorState::default();
             stage_claude_as(
                 dir,
@@ -3245,7 +3325,7 @@ mod tests {
             .commands
             .insert("claude-work".into(), "claude --resume {value}".into());
         assert_eq!(
-            claude_restart_relaunch_as("personal", "claude-work", config),
+            claude_restart_relaunch_as("personal", "claude-work", config, &[]),
             "4:pane run w2A:p1 claude --profile personal --resume sess-p-1"
         );
     }
@@ -3255,6 +3335,149 @@ mod tests {
         assert_eq!(
             claude_restart_relaunch("work"),
             "4:pane run w2A:p1 claude --resume sess-p-1"
+        );
+    }
+
+    #[test]
+    fn poll_once_resumes_claude_with_remembered_skip_permissions() {
+        let skip = ["--dangerously-skip-permissions"];
+        assert_eq!(
+            claude_restart_relaunch_as("personal", "claude", Config::default(), &skip),
+            "4:pane run w2A:p1 claude --profile personal --dangerously-skip-permissions --resume sess-p-1"
+        );
+        assert_eq!(
+            claude_restart_relaunch_as("work", "claude", Config::default(), &skip),
+            "4:pane run w2A:p1 claude --dangerously-skip-permissions --resume sess-p-1"
+        );
+        // A template that already carries the flag is not doubled.
+        let mut config = Config::default();
+        config.commands.insert(
+            "claude".into(),
+            "claude --dangerously-skip-permissions --resume {value}".into(),
+        );
+        assert_eq!(
+            claude_restart_relaunch_as("work", "claude", config, &skip),
+            "4:pane run w2A:p1 claude --dangerously-skip-permissions --resume sess-p-1"
+        );
+    }
+
+    /// Without claude-profile: herdr-reported argv `runs` (one live
+    /// poll each, in order) for a claude pane with a saved session, then
+    /// a host restart; returns the relaunch line.
+    fn reported_argv_restart_relaunch(runs: &[&[&str]]) -> String {
+        let xdg = crate::test_support::unique_temp_dir("xdg");
+        std::fs::create_dir_all(&xdg).expect("xdg");
+        let xdg_s = xdg.to_string_lossy().into_owned();
+        let mut line = String::new();
+        run_with_fake_herdr(STAGED_SCRIPT, &[("XDG_DATA_HOME", Some(&xdg_s))], |dir| {
+            crate::test_support::remember(
+                "w2A:p1",
+                SessionRef {
+                    agent: "claude".into(),
+                    value: "sess-r-1".into(),
+                },
+            );
+            let mut st = MonitorState::default();
+            for argv in runs {
+                stage_claude(
+                    dir,
+                    &xdg,
+                    std::os::unix::process::parent_id(),
+                    serde_json::json!([{"argv": argv, "name": "claude"}]),
+                );
+                assert!(poll_once("w2A:p1", &Config::default(), &mut st)); // live
+            }
+            stage_claude(dir, &xdg, std::process::id(), idle_zsh());
+            assert!(poll_once("w2A:p1", &Config::default(), &mut st)); // host restarted
+            line = herdr_calls(dir)
+                .lines()
+                .find(|l| l.contains("pane run"))
+                .unwrap_or_default()
+                .to_string();
+        });
+        std::fs::remove_dir_all(&xdg).ok();
+        line
+    }
+
+    #[test]
+    fn poll_once_remembers_skip_permissions_without_claude_profile() {
+        assert_eq!(
+            reported_argv_restart_relaunch(&[&["claude", "--dangerously-skip-permissions"]]),
+            "4:pane run w2A:p1 claude --dangerously-skip-permissions --resume sess-r-1"
+        );
+    }
+
+    #[test]
+    fn poll_once_forgets_skip_permissions_after_a_plain_run() {
+        assert_eq!(
+            reported_argv_restart_relaunch(&[
+                &["claude", "--dangerously-skip-permissions"],
+                &["claude", "--resume", "sess-r-1"],
+            ]),
+            "4:pane run w2A:p1 claude --resume sess-r-1"
+        );
+    }
+
+    #[test]
+    fn name_only_claude_without_readable_cmdline_keeps_last_answer() {
+        run_with_fake_herdr(STAGED_SCRIPT, &[], |_| {
+            let pane: Pane =
+                serde_json::from_value(serde_json::json!({"pane_id": "w2A:p1"})).expect("pane");
+            let entries = |fg: serde_json::Value| {
+                foreground_entries(&serde_json::json!({"foreground_processes": fg}))
+            };
+            let flagged = entries(serde_json::json!([
+                {"argv": ["claude", "--dangerously-skip-permissions"], "name": "claude"}
+            ]));
+            maybe_capture_claude_permissions(&pane, Some("claude"), &flagged);
+            assert!(crate::state::skip_permissions_for("w2A:p1"));
+            // Name-only, no pid (or a dead one): says nothing.
+            for fg in [
+                serde_json::json!([{"name": "claude"}]),
+                serde_json::json!([{"name": "claude", "pid": u32::MAX}]),
+            ] {
+                maybe_capture_claude_permissions(&pane, Some("claude"), &entries(fg));
+                assert!(crate::state::skip_permissions_for("w2A:p1"));
+            }
+            // Another agent's pane never records (a `claude -p` child).
+            maybe_capture_claude_permissions(
+                &pane,
+                Some("opencode"),
+                &entries(serde_json::json!([{"argv": ["claude", "-p"], "name": "claude"}])),
+            );
+            assert!(crate::state::skip_permissions_for("w2A:p1"));
+            maybe_capture_claude_permissions(
+                &pane,
+                Some("claude"),
+                &entries(serde_json::json!([{"argv": ["claude", "-c"], "name": "claude"}])),
+            );
+            assert!(!crate::state::skip_permissions_for("w2A:p1"));
+        });
+    }
+
+    #[test]
+    fn with_skip_permissions_flags_only_claude_templates() {
+        let argv = |s: &str| crate::resume::split_argv(s);
+        let flag = crate::claude_profile::SKIP_PERMISSIONS_FLAG;
+        assert_eq!(
+            with_skip_permissions("claude", argv("/usr/bin/claude --resume X"), true),
+            (argv(&format!("/usr/bin/claude {flag} --resume X")), true)
+        );
+        assert_eq!(
+            with_skip_permissions("claude", argv("claude --resume X"), false),
+            (argv("claude --resume X"), true)
+        );
+        let carried = argv(&format!("claude --resume X {flag}"));
+        assert_eq!(
+            with_skip_permissions("claude", carried.clone(), true),
+            (carried, true),
+            "already in the template"
+        );
+        let launcher = argv("env FOO=1 claude --resume X");
+        assert_eq!(
+            with_skip_permissions("env", launcher.clone(), true),
+            (launcher, false),
+            "launcher prefix: not applied, reported"
         );
     }
 
