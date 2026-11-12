@@ -78,6 +78,28 @@ pub fn config_dir_of(pid: u32) -> Option<PathBuf> {
         .map(|v| PathBuf::from(String::from_utf8_lossy(v).into_owned()))
 }
 
+/// Claude Code's flag for running without permission prompts (what the
+/// user's `claude --yolo` shell wrapper expands to, so it is the only
+/// spelling a process argv ever shows).
+pub const SKIP_PERMISSIONS_FLAG: &str = "--dangerously-skip-permissions";
+
+/// Whether an argv carries [`SKIP_PERMISSIONS_FLAG`].
+pub fn argv_skips_permissions(argv: &[String]) -> bool {
+    argv.iter().any(|a| a == SKIP_PERMISSIONS_FLAG)
+}
+
+/// A live process's argv (`/proc/<pid>/cmdline`); None when unreadable
+/// or empty (no procfs, process gone, kernel thread).
+pub fn argv_of(pid: u32) -> Option<Vec<String>> {
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let argv: Vec<String> = cmdline
+        .split(|b| *b == 0)
+        .filter(|a| !a.is_empty())
+        .map(|a| String::from_utf8_lossy(a).into_owned())
+        .collect();
+    (!argv.is_empty()).then_some(argv)
+}
+
 /// The session id Claude Code recorded for `pid` under `config`
 /// (`sessions/<pid>.json`); unsafe ids are refused like any session.
 pub fn session_of(config: &Path, pid: u32) -> Option<String> {
@@ -202,5 +224,40 @@ mod tests {
             .expect("unsafe");
         assert_eq!(session_of(&personal, 4244), None, "unsafe id refused");
         std::fs::remove_dir_all(&data).ok();
+    }
+
+    #[test]
+    fn argv_read_from_live_process_and_checked_for_skip_flag() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn");
+        let pid = child.id();
+        // The cmdline of a just-forked child can still be ours.
+        let mut argv = None;
+        for _ in 0..200 {
+            argv = argv_of(pid);
+            if argv
+                .as_ref()
+                .is_some_and(|a| a.last().is_some_and(|l| l == "30"))
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        child.kill().ok();
+        child.wait().ok();
+        assert_eq!(argv, Some(vec!["sleep".to_string(), "30".to_string()]));
+        assert_eq!(argv_of(u32::MAX), None, "no such process");
+
+        let argv = |s: &str| crate::resume::split_argv(s);
+        assert!(argv_skips_permissions(&argv(
+            "claude --dangerously-skip-permissions --resume X"
+        )));
+        assert!(!argv_skips_permissions(&argv("claude --resume X")));
+        assert!(
+            !argv_skips_permissions(&argv("claude --allow-dangerously-skip-permissions")),
+            "exact token only"
+        );
     }
 }

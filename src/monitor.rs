@@ -57,6 +57,9 @@ struct ProcEntry {
     /// for the fail-closed poison sentinel.
     argv: Vec<String>,
     pid: Option<u32>,
+    /// `argv` was synthesized from `name` (herdr reported no argv), so
+    /// it says nothing about the flags the process was started with.
+    name_only: bool,
 }
 
 impl ProcEntry {
@@ -65,6 +68,7 @@ impl ProcEntry {
             name: None,
             argv,
             pid: None,
+            name_only: false,
         }
     }
 }
@@ -121,6 +125,7 @@ fn entries_from_list(v: &serde_json::Value) -> Vec<ProcEntry> {
                         name: name.map(str::to_string),
                         argv: a,
                         pid,
+                        name_only: false,
                     });
                     continue;
                 }
@@ -139,6 +144,7 @@ fn entries_from_list(v: &serde_json::Value) -> Vec<ProcEntry> {
                     name: Some(name.to_string()),
                     argv: vec![name.to_string()],
                     pid,
+                    name_only: true,
                 });
                 continue;
             }
@@ -739,6 +745,83 @@ fn maybe_capture_claude(
     Some(sess)
 }
 
+/// Permission-mode capture: while the pane's agent runs claude (same
+/// gate as [`maybe_capture_claude`], without needing claude-profile),
+/// remember whether it was started with
+/// `--dangerously-skip-permissions`, so the relaunch keeps the mode.
+/// Both answers are recorded: a later plain run clears an earlier skip.
+///
+/// Each claude entry's argv is the process's own (`/proc/<pid>/cmdline`:
+/// herdr reports claude name-only), else the one herdr reported
+/// ([`claude_entry_argv`]); an entry with neither is unknown. Fail
+/// closed across entries: any known plain claude records a plain run,
+/// and a skip is recorded only when EVERY claude entry is known and
+/// carries the flag and no entry was dropped as unparseable — so a
+/// `claude -p --dangerously-skip-permissions` child never lends a plain
+/// (or unreadable) session the flag. Otherwise the last answer stands.
+fn maybe_capture_claude_permissions(pane: &Pane, program: Option<&str>, procs: &[ProcEntry]) {
+    let Some(program) = program.filter(|p| *p == "claude") else {
+        return;
+    };
+    let claudes: Vec<Option<bool>> = procs
+        .iter()
+        .filter(|e| entry_runs(e, program))
+        .map(|e| {
+            claude_entry_argv(e).map(|argv| crate::claude_profile::argv_skips_permissions(&argv))
+        })
+        .collect();
+    let poisoned = procs
+        .iter()
+        .any(|e| e.argv.iter().any(|t| t == UNPARSEABLE));
+    let skip = if claudes.contains(&Some(false)) {
+        false
+    } else if !claudes.is_empty() && !poisoned && claudes.iter().all(|c| *c == Some(true)) {
+        true
+    } else {
+        return;
+    };
+    crate::state::record_skip_permissions(&pane.pane_id, skip);
+}
+
+/// The argv a claude entry was started with, when known: the process's
+/// own cmdline, else the one herdr reported (never a name-only entry's
+/// synthesized `[name]`); see [`known_argv`].
+fn claude_entry_argv(entry: &ProcEntry) -> Option<Vec<String>> {
+    known_argv(
+        entry.pid.and_then(crate::claude_profile::argv_of),
+        (!entry.name_only).then(|| entry.argv.clone()),
+    )
+}
+
+/// `own` (a process's cmdline) over `reported` (herdr's argv for it),
+/// except that a one-token cmdline yields to a longer reported argv: a
+/// runtime that retitles itself (node's `process.title`) overwrites its
+/// cmdline with the bare title.
+fn known_argv(own: Option<Vec<String>>, reported: Option<Vec<String>>) -> Option<Vec<String>> {
+    match (own, reported) {
+        (Some(own), Some(reported)) if own.len() == 1 && reported.len() > 1 => Some(reported),
+        (Some(own), _) => Some(own),
+        (None, reported) => reported,
+    }
+}
+
+/// `claude --dangerously-skip-permissions ...` when the pane's Claude
+/// was last seen running with it (the flag goes right after argv[0]);
+/// otherwise — or when the template already carries it — the argv
+/// unchanged. Like [`with_claude_profile`], only a template whose
+/// `program` is `claude` takes the flag; the flag is `false` when it
+/// was needed but could not be applied (the caller logs a warning).
+fn with_skip_permissions(program: &str, mut argv: Vec<String>, skip: bool) -> (Vec<String>, bool) {
+    if !skip || crate::claude_profile::argv_skips_permissions(&argv) {
+        return (argv, true);
+    }
+    if program != "claude" {
+        return (argv, false);
+    }
+    argv.insert(1, crate::claude_profile::SKIP_PERMISSIONS_FLAG.to_string());
+    (argv, true)
+}
+
 /// Whether a relaunch resumes under a claude-profile: the `claude`
 /// agent, or any agent whose template `program` (the
 /// [`PollAction::Relaunch`] one, argv[0]'s basename) is `claude` (an
@@ -994,6 +1077,7 @@ fn poll_once(pane_id: &str, config: &Config, st: &mut MonitorState) -> bool {
     ) {
         pane.agent_session.get_or_insert(sess);
     }
+    maybe_capture_claude_permissions(&pane, program.as_deref(), &procs);
     let shell = info.as_ref().and_then(shell_pid).and_then(shell_identity);
     // Liveness evidence for `classify_idle`: the pane's agent is running
     // under this shell right now. Positive program match only — a stale
@@ -1114,6 +1198,17 @@ fn poll_once(pane_id: &str, config: &Config, st: &mut MonitorState) -> bool {
             } else {
                 (None, None)
             };
+            // The permission mode first, so a profile lands ahead of it
+            // (`claude --profile <name> --dangerously-skip-permissions ...`).
+            let skip = claude_profile_applies(&agent, &program)
+                && crate::state::skip_permissions_for(pane_id);
+            let (argv, skip_applied) = with_skip_permissions(&program, argv, skip);
+            if !skip_applied {
+                crate::state::append_log(&format!(
+                    "monitor {pane_id}: WARNING resume command does not start with `claude` (use a direct-binary template); relaunching without {}",
+                    crate::claude_profile::SKIP_PERMISSIONS_FLAG
+                ));
+            }
             let (argv, applied) =
                 with_claude_profile(&program, argv, profile.as_deref(), default.as_deref());
             if !applied {
@@ -1819,6 +1914,7 @@ mod tests {
             name: None,
             argv: argv.iter().map(|t| t.to_string()).collect(),
             pid: Some(pid),
+            name_only: false,
         };
         let commands = Config::default().commands;
         let sighting = |entries: &[ProcEntry]| {
@@ -1864,6 +1960,7 @@ mod tests {
             name: None,
             argv: vec!["opencode".into(), "--session".into(), value.into()],
             pid: Some(pid),
+            name_only: false,
         };
         let commands = Config::default().commands;
         let (a, b) = (entry("s1", 20), entry("s2", 10));
@@ -3091,8 +3188,21 @@ mod tests {
     /// A stand-in Claude process running under `config` (its environ is
     /// what the monitor reads), with `sessions/<pid>.json` naming `sid`.
     fn fake_claude(config: &std::path::Path, sid: &str) -> std::process::Child {
-        let child = std::process::Command::new("sleep")
-            .arg("60")
+        fake_claude_with(config, sid, &[])
+    }
+
+    /// [`fake_claude`] started with `flags` (its cmdline is what the
+    /// monitor reads): a shell blocked on its piped stdin, the flags
+    /// riding along as positional parameters.
+    fn fake_claude_with(
+        config: &std::path::Path,
+        sid: &str,
+        flags: &[&str],
+    ) -> std::process::Child {
+        let child = std::process::Command::new("sh")
+            .args(["-c", "read _", "claude"])
+            .args(flags)
+            .stdin(std::process::Stdio::piped())
             .env("CLAUDE_CONFIG_DIR", config)
             .spawn()
             .expect("spawn fake claude");
@@ -3102,12 +3212,18 @@ mod tests {
             format!(r#"{{"pid":{pid},"sessionId":"{sid}"}}"#),
         )
         .expect("session file");
+        // The environ and cmdline of a just-forked child can still be ours.
+        let ready = || {
+            crate::claude_profile::config_dir_of(pid).as_deref() == Some(config)
+                && crate::claude_profile::argv_of(pid).is_some_and(|a| a[0] == "sh")
+        };
         for _ in 0..200 {
-            if crate::claude_profile::config_dir_of(pid).as_deref() == Some(config) {
+            if ready() {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        assert!(ready(), "fake claude {pid} never showed its own environ/cmdline");
         child
     }
 
@@ -3146,17 +3262,23 @@ mod tests {
     /// Live claude (agent session invisible to herdr) under `profile`,
     /// then a host restart; returns the relaunch line typed.
     fn claude_restart_relaunch(profile: &str) -> String {
-        claude_restart_relaunch_as(profile, "claude", Config::default())
+        claude_restart_relaunch_as(profile, "claude", Config::default(), &[])
     }
 
-    /// [`claude_restart_relaunch`] for a pane labelled `agent`.
-    fn claude_restart_relaunch_as(profile: &str, agent: &str, config: Config) -> String {
+    /// [`claude_restart_relaunch`] for a pane labelled `agent`, its
+    /// Claude started with `flags`.
+    fn claude_restart_relaunch_as(
+        profile: &str,
+        agent: &str,
+        config: Config,
+        flags: &[&str],
+    ) -> String {
         let xdg = crate::test_support::unique_temp_dir("xdg");
         let data = claude_profiles(&xdg);
         let xdg_s = xdg.to_string_lossy().into_owned();
         let mut line = String::new();
         run_with_fake_herdr(STAGED_SCRIPT, &[("XDG_DATA_HOME", Some(&xdg_s))], |dir| {
-            let mut claude = fake_claude(&data.join(profile), "sess-p-1");
+            let mut claude = fake_claude_with(&data.join(profile), "sess-p-1", flags);
             let mut st = MonitorState::default();
             stage_claude_as(
                 dir,
@@ -3245,7 +3367,7 @@ mod tests {
             .commands
             .insert("claude-work".into(), "claude --resume {value}".into());
         assert_eq!(
-            claude_restart_relaunch_as("personal", "claude-work", config),
+            claude_restart_relaunch_as("personal", "claude-work", config, &[]),
             "4:pane run w2A:p1 claude --profile personal --resume sess-p-1"
         );
     }
@@ -3255,6 +3377,303 @@ mod tests {
         assert_eq!(
             claude_restart_relaunch("work"),
             "4:pane run w2A:p1 claude --resume sess-p-1"
+        );
+    }
+
+    #[test]
+    fn poll_once_resumes_claude_with_remembered_skip_permissions() {
+        let skip = ["--dangerously-skip-permissions"];
+        assert_eq!(
+            claude_restart_relaunch_as("personal", "claude", Config::default(), &skip),
+            "4:pane run w2A:p1 claude --profile personal --dangerously-skip-permissions --resume sess-p-1"
+        );
+        assert_eq!(
+            claude_restart_relaunch_as("work", "claude", Config::default(), &skip),
+            "4:pane run w2A:p1 claude --dangerously-skip-permissions --resume sess-p-1"
+        );
+        // A template that already carries the flag is not doubled.
+        let mut config = Config::default();
+        config.commands.insert(
+            "claude".into(),
+            "claude --dangerously-skip-permissions --resume {value}".into(),
+        );
+        assert_eq!(
+            claude_restart_relaunch_as("work", "claude", config, &skip),
+            "4:pane run w2A:p1 claude --dangerously-skip-permissions --resume sess-p-1"
+        );
+    }
+
+    /// Without claude-profile: herdr-reported argv `runs` (one live
+    /// poll each, in order) for a claude pane with a saved session, then
+    /// a host restart; returns the relaunch line.
+    fn reported_argv_restart_relaunch(runs: &[&[&str]]) -> String {
+        let xdg = crate::test_support::unique_temp_dir("xdg");
+        std::fs::create_dir_all(&xdg).expect("xdg");
+        let xdg_s = xdg.to_string_lossy().into_owned();
+        let mut line = String::new();
+        run_with_fake_herdr(STAGED_SCRIPT, &[("XDG_DATA_HOME", Some(&xdg_s))], |dir| {
+            crate::test_support::remember(
+                "w2A:p1",
+                SessionRef {
+                    agent: "claude".into(),
+                    value: "sess-r-1".into(),
+                },
+            );
+            let mut st = MonitorState::default();
+            for argv in runs {
+                stage_claude(
+                    dir,
+                    &xdg,
+                    std::os::unix::process::parent_id(),
+                    serde_json::json!([{"argv": argv, "name": "claude"}]),
+                );
+                assert!(poll_once("w2A:p1", &Config::default(), &mut st)); // live
+            }
+            stage_claude(dir, &xdg, std::process::id(), idle_zsh());
+            assert!(poll_once("w2A:p1", &Config::default(), &mut st)); // host restarted
+            line = herdr_calls(dir)
+                .lines()
+                .find(|l| l.contains("pane run"))
+                .unwrap_or_default()
+                .to_string();
+        });
+        std::fs::remove_dir_all(&xdg).ok();
+        line
+    }
+
+    #[test]
+    fn poll_once_remembers_skip_permissions_without_claude_profile() {
+        assert_eq!(
+            reported_argv_restart_relaunch(&[&["claude", "--dangerously-skip-permissions"]]),
+            "4:pane run w2A:p1 claude --dangerously-skip-permissions --resume sess-r-1"
+        );
+    }
+
+    #[test]
+    fn poll_once_forgets_skip_permissions_after_a_plain_run() {
+        assert_eq!(
+            reported_argv_restart_relaunch(&[
+                &["claude", "--dangerously-skip-permissions"],
+                &["claude", "--resume", "sess-r-1"],
+            ]),
+            "4:pane run w2A:p1 claude --resume sess-r-1"
+        );
+        // A bare `claude` is a reported argv too, not a name-only entry.
+        assert_eq!(
+            reported_argv_restart_relaunch(&[
+                &["claude", "--dangerously-skip-permissions"],
+                &["claude"],
+            ]),
+            "4:pane run w2A:p1 claude --resume sess-r-1"
+        );
+    }
+
+    #[test]
+    fn name_only_claude_without_readable_cmdline_keeps_last_answer() {
+        run_with_fake_herdr(STAGED_SCRIPT, &[], |_| {
+            let pane: Pane =
+                serde_json::from_value(serde_json::json!({"pane_id": "w2A:p1"})).expect("pane");
+            let entries = |fg: serde_json::Value| {
+                foreground_entries(&serde_json::json!({"foreground_processes": fg}))
+            };
+            let flagged = entries(serde_json::json!([
+                {"argv": ["claude", "--dangerously-skip-permissions"], "name": "claude"}
+            ]));
+            maybe_capture_claude_permissions(&pane, Some("claude"), &flagged);
+            assert!(crate::state::skip_permissions_for("w2A:p1"));
+            // Name-only, no pid (or a dead one): says nothing.
+            for fg in [
+                serde_json::json!([{"name": "claude"}]),
+                serde_json::json!([{"name": "claude", "pid": u32::MAX}]),
+            ] {
+                maybe_capture_claude_permissions(&pane, Some("claude"), &entries(fg));
+                assert!(crate::state::skip_permissions_for("w2A:p1"));
+            }
+            // Another agent's pane never records (a `claude -p` child).
+            maybe_capture_claude_permissions(
+                &pane,
+                Some("opencode"),
+                &entries(serde_json::json!([{"argv": ["claude", "-p"], "name": "claude"}])),
+            );
+            assert!(crate::state::skip_permissions_for("w2A:p1"));
+            // A reported bare `claude` is a plain run: it clears.
+            maybe_capture_claude_permissions(
+                &pane,
+                Some("claude"),
+                &entries(serde_json::json!([{"argv": ["claude"], "name": "claude"}])),
+            );
+            assert!(!crate::state::skip_permissions_for("w2A:p1"));
+        });
+    }
+
+    #[test]
+    fn skip_permissions_needs_every_claude_process_known_and_carrying_it() {
+        run_with_fake_herdr(STAGED_SCRIPT, &[], |_| {
+            let pane: Pane = serde_json::from_value(serde_json::json!({"pane_id": "w2A:p1"}))
+                .expect("pane");
+            let capture = |fg: serde_json::Value| {
+                let entries = foreground_entries(&serde_json::json!({"foreground_processes": fg}));
+                maybe_capture_claude_permissions(&pane, Some("claude"), &entries);
+                crate::state::skip_permissions_for("w2A:p1")
+            };
+            let flagged = ["claude", "-p", "--dangerously-skip-permissions"];
+            // A flagged `claude -p` child of a plain session never lends
+            // it the flag, whichever pid is lower (pids unreadable here,
+            // so the reported argv counts).
+            for (plain_pid, child_pid) in [(u32::MAX - 1, u32::MAX), (u32::MAX, u32::MAX - 1)] {
+                assert!(!capture(serde_json::json!([
+                    {"argv": ["claude"], "name": "claude", "pid": plain_pid},
+                    {"argv": flagged, "name": "claude", "pid": child_pid}
+                ])));
+            }
+            assert!(capture(serde_json::json!([
+                {"argv": flagged, "name": "claude"},
+                {"argv": ["claude", "--dangerously-skip-permissions"], "name": "claude"}
+            ])));
+            // An unknown claude (name-only) or a dropped entry beside a
+            // flagged one is no evidence either way: the answer stands,
+            // from `false` as from `true`.
+            let unknown = serde_json::json!([
+                {"argv": flagged, "name": "claude"},
+                {"name": "claude"}
+            ]);
+            let dropped = serde_json::json!([{"argv": flagged, "name": "claude"}, 42]);
+            assert!(capture(unknown.clone()));
+            assert!(capture(dropped.clone()));
+            assert!(!capture(serde_json::json!([{"argv": ["claude"], "name": "claude"}])));
+            assert!(!capture(unknown.clone()));
+            assert!(!capture(dropped.clone()));
+            // A known plain claude clears even beside an unknown or
+            // dropped entry.
+            let plain = serde_json::json!({"argv": ["claude"], "name": "claude"});
+            for beside in [serde_json::json!({"name": "claude"}), serde_json::json!(42)] {
+                assert!(capture(serde_json::json!([
+                    {"argv": flagged, "name": "claude"}
+                ])));
+                assert!(!capture(serde_json::json!([plain.clone(), beside])));
+            }
+        });
+    }
+
+    #[test]
+    fn known_argv_prefers_cmdline_unless_retitled() {
+        let argv = |s: &str| Some(crate::resume::split_argv(s));
+        let flagged = || argv("claude --dangerously-skip-permissions");
+        assert_eq!(known_argv(argv("claude -c"), flagged()), argv("claude -c"));
+        assert_eq!(known_argv(argv("claude -c"), None), argv("claude -c"));
+        assert_eq!(known_argv(None, flagged()), flagged());
+        assert_eq!(known_argv(None, None), None);
+        // A one-token cmdline (a retitled runtime) yields to a longer
+        // report, but not to an equally bare one.
+        assert_eq!(known_argv(argv("claude"), flagged()), flagged());
+        assert_eq!(known_argv(argv("claude"), argv("node")), argv("claude"));
+        // A name-only entry's synthesized argv is never the report.
+        let name_only = ProcEntry {
+            name: Some("claude".into()),
+            argv: vec!["claude".into()],
+            pid: None,
+            name_only: true,
+        };
+        assert_eq!(claude_entry_argv(&name_only), None);
+    }
+
+    #[test]
+    fn skip_permissions_follow_the_live_process_cmdline() {
+        // Live shape (herdr 0.9.5): claude is name + pid, so the flag
+        // comes from /proc/<pid>/cmdline; a later plain process clears.
+        let spawn = |flags: &[&str]| {
+            let child = std::process::Command::new("sh")
+                .args(["-c", "read _", "claude"])
+                .args(flags)
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn fake claude");
+            let ready = || crate::claude_profile::argv_of(child.id()).is_some_and(|a| a[0] == "sh");
+            for _ in 0..200 {
+                if ready() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(ready(), "fake claude never showed its own cmdline");
+            child
+        };
+        run_with_fake_herdr(STAGED_SCRIPT, &[], |_| {
+            let pane: Pane = serde_json::from_value(serde_json::json!({"pane_id": "w2A:p1"}))
+                .expect("pane");
+            for (flags, expected) in [
+                (&["--dangerously-skip-permissions"][..], true),
+                (&[][..], false),
+            ] {
+                let mut claude = spawn(flags);
+                let entries = foreground_entries(&serde_json::json!({"foreground_processes": [
+                    {"name": "claude", "pid": claude.id()}
+                ]}));
+                maybe_capture_claude_permissions(&pane, Some("claude"), &entries);
+                claude.kill().ok();
+                claude.wait().ok();
+                assert_eq!(crate::state::skip_permissions_for("w2A:p1"), expected);
+            }
+            // The process's own cmdline outranks a disagreeing report.
+            assert!(crate::state::record_skip_permissions("w2A:p1", true));
+            let mut claude = spawn(&[]);
+            let entries = foreground_entries(&serde_json::json!({"foreground_processes": [
+                {"argv": ["claude", "--dangerously-skip-permissions"], "name": "claude",
+                 "pid": claude.id()}
+            ]}));
+            maybe_capture_claude_permissions(&pane, Some("claude"), &entries);
+            claude.kill().ok();
+            claude.wait().ok();
+            assert!(!crate::state::skip_permissions_for("w2A:p1"));
+            // ...unless that cmdline is a bare one-token title: then the
+            // longer report is the argv ([`known_argv`]).
+            let mut retitled = std::process::Command::new("cat")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn one-token process");
+            let bare = || crate::claude_profile::argv_of(retitled.id()) == Some(vec!["cat".into()]);
+            for _ in 0..200 {
+                if bare() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(bare(), "one-token stand-in never showed its own cmdline");
+            let entries = foreground_entries(&serde_json::json!({"foreground_processes": [
+                {"argv": ["claude", "--dangerously-skip-permissions"], "name": "claude",
+                 "pid": retitled.id()}
+            ]}));
+            maybe_capture_claude_permissions(&pane, Some("claude"), &entries);
+            retitled.kill().ok();
+            retitled.wait().ok();
+            assert!(crate::state::skip_permissions_for("w2A:p1"));
+        });
+    }
+
+    #[test]
+    fn with_skip_permissions_flags_only_claude_templates() {
+        let argv = |s: &str| crate::resume::split_argv(s);
+        let flag = crate::claude_profile::SKIP_PERMISSIONS_FLAG;
+        assert_eq!(
+            with_skip_permissions("claude", argv("/usr/bin/claude --resume X"), true),
+            (argv(&format!("/usr/bin/claude {flag} --resume X")), true)
+        );
+        assert_eq!(
+            with_skip_permissions("claude", argv("claude --resume X"), false),
+            (argv("claude --resume X"), true)
+        );
+        let carried = argv(&format!("claude --resume X {flag}"));
+        assert_eq!(
+            with_skip_permissions("claude", carried.clone(), true),
+            (carried, true),
+            "already in the template"
+        );
+        let launcher = argv("env FOO=1 claude --resume X");
+        assert_eq!(
+            with_skip_permissions("env", launcher.clone(), true),
+            (launcher, false),
+            "launcher prefix: not applied, reported"
         );
     }
 
