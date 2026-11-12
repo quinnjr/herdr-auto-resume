@@ -3507,7 +3507,7 @@ mod tests {
     }
 
     #[test]
-    fn skip_permissions_needs_every_known_claude_process_to_carry_it() {
+    fn skip_permissions_needs_every_claude_process_known_and_carrying_it() {
         run_with_fake_herdr(STAGED_SCRIPT, &[], |_| {
             let pane: Pane = serde_json::from_value(serde_json::json!({"pane_id": "w2A:p1"}))
                 .expect("pane");
@@ -3541,8 +3541,17 @@ mod tests {
             assert!(capture(unknown.clone()));
             assert!(capture(dropped.clone()));
             assert!(!capture(serde_json::json!([{"argv": ["claude"], "name": "claude"}])));
-            assert!(!capture(unknown));
-            assert!(!capture(dropped));
+            assert!(!capture(unknown.clone()));
+            assert!(!capture(dropped.clone()));
+            // A known plain claude clears even beside an unknown or
+            // dropped entry.
+            let plain = serde_json::json!({"argv": ["claude"], "name": "claude"});
+            for beside in [serde_json::json!({"name": "claude"}), serde_json::json!(42)] {
+                assert!(capture(serde_json::json!([
+                    {"argv": flagged, "name": "claude"}
+                ])));
+                assert!(!capture(serde_json::json!([plain.clone(), beside])));
+            }
         });
     }
 
@@ -3616,6 +3625,29 @@ mod tests {
             claude.kill().ok();
             claude.wait().ok();
             assert!(!crate::state::skip_permissions_for("w2A:p1"));
+            // ...unless that cmdline is a bare one-token title: then the
+            // longer report is the argv ([`known_argv`]).
+            let mut retitled = std::process::Command::new("cat")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn one-token process");
+            let bare = || crate::claude_profile::argv_of(retitled.id()) == Some(vec!["cat".into()]);
+            for _ in 0..200 {
+                if bare() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(bare(), "one-token stand-in never showed its own cmdline");
+            let entries = foreground_entries(&serde_json::json!({"foreground_processes": [
+                {"argv": ["claude", "--dangerously-skip-permissions"], "name": "claude",
+                 "pid": retitled.id()}
+            ]}));
+            maybe_capture_claude_permissions(&pane, Some("claude"), &entries);
+            retitled.kill().ok();
+            retitled.wait().ok();
+            assert!(crate::state::skip_permissions_for("w2A:p1"));
         });
     }
 

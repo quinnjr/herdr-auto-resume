@@ -233,7 +233,9 @@ needs no claude-profile):
   remembered only when every one of them has a known argv carrying it,
   and any known plain one records a plain run: a
   `claude -p --dangerously-skip-permissions` child of a plain session
-  never lends it the flag.
+  never lends it the flag. Conversely, a long-lived plain claude child
+  (e.g. a `claude mcp serve` MCP server) makes a flagged session resume
+  without it.
 - On a host restart, a pane last seen with the flag resumes as
   `claude --dangerously-skip-permissions --resume <id>` (right after
   argv[0], behind a `--profile <name>` when both apply; not doubled when
