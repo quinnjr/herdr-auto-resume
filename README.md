@@ -144,6 +144,24 @@ cargo build --release && cp target/release/auto-resume .
 herdr plugin link ~/Projects/herdr-auto-resume
 ```
 
+### Herdr's own agent restore
+
+Herdr resumes agent panes itself after a server restart
+(`[session] resume_agents_on_restore`, on by default), using the bare
+session id of the config dir it was started with. It runs before the
+monitors act, so the panes it restores never go through auto-resume and
+lose what only auto-resume knows: the `--dangerously-skip-permissions`
+mode, a custom `commands` template and `resume_message`. Turn it off in
+`~/.config/herdr/config.toml` to let auto-resume do every relaunch:
+
+```toml
+[session]
+resume_agents_on_restore = false
+```
+
+Apply it with `herdr server reload-config`. Agents without an
+auto-resume template then no longer resume after a restart.
+
 Plugin commands resolve `./auto-resume` relative to the plugin directory
 (Herdr runs them with the plugin dir as cwd), so no PATH wiring is needed.
 The binary lives at the repo root (`./auto-resume`) and is gitignored.
@@ -243,6 +261,13 @@ needs no claude-profile):
 - A pane never seen running Claude, or whose claude argv was never known
   (no `/proc/<pid>/cmdline`, e.g. macOS, and herdr reporting the name
   only), resumes without the flag.
+
+This only covers relaunches auto-resume performs. Herdr's own restore
+(`resume_agents_on_restore`, on by default) restarts a Claude pane as a
+plain `claude --resume <id>` the moment the server starts, ahead of the
+monitor: the flag is dropped, and the plain run then clears the pane's
+remembered mode. Turn it off so auto-resume does the relaunch; see
+[Herdr's own agent restore](#herdrs-own-agent-restore).
 - Like profiles, this needs a direct-binary template. Under a launcher
   template (`env FOO=1 claude ...`) the agent's program is not `claude`,
   so nothing is recorded and the flag is never added (put it in the
